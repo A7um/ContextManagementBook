@@ -2,9 +2,13 @@
 
 ## Cursor Cloud specific instructions
 
-This repository (`ContextManagementBook`) is currently an empty/placeholder repo with only a `README.md`. There are no services, no dependencies, no build steps, and no tests to run.
+This repository is a **book project** (pure markdown, no code/services). There are no dependencies, build steps, tests, or services to run.
 
-When code is added in the future, update this section with:
-- How to install dependencies and which package manager to use.
-- How to run lint, tests, and the dev server.
-- Any non-obvious startup or environment caveats.
+### Structure
+- `README.md` — Book overview and table of contents
+- `chapters/` — 13 chapter files in markdown format (01 through 13)
+
+### Development
+- No package manager, no build system, no tests
+- To review/edit: read and edit the markdown files directly
+- The book follows a numbered chapter convention: `chapters/NN-topic-name.md`
