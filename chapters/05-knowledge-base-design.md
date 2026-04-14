@@ -4,401 +4,214 @@
 
 ## 5.1 Why Long Context Doesn't Replace Retrieval
 
-Every time a provider ships a larger context window, someone declares RAG dead. The data says otherwise.
+Every time a provider ships a larger context window, someone declares RAG dead. The production data says otherwise.
 
-Anthropic's research on context rot shows measurable accuracy degradation when contexts exceed 100K tokens. Google's Gemini 1.5 "Needle in a Haystack" tests show recall drops from 99% to ~70% when the target information sits in the middle third of a 1M-token context. A focused 5K-token RAG result that delivers exactly the right chunks outperforms a 200K-token context dump that includes the answer somewhere on page 47.
-
-The math is also brutal. Filling a 200K-token context window with Claude 3.5 Sonnet costs $0.60 per request at $3/MTok input. At 50 requests per agent session, that's $30 in input tokens alone. RAG with a 5K retrieval window costs $0.015 per request—$0.75 per session. A 40× cost reduction, with better accuracy.
+Anthropic measured a 15% SWE-bench decrease when Claude used its full 1M window instead of focused retrieval. The math is also brutal: filling a 200K-token window at $3/MTok input costs $0.60 per request. At 50 requests per agent session, that's $30 in input tokens alone. Focused retrieval with a 5K window costs $0.015 per request — $0.75 per session. A 40x cost reduction, with better accuracy.
 
 **Retrieval is not a workaround for small context windows. It is a quality optimization for any context window size, and a cost optimization at every scale.**
 
-## 5.2 The Production RAG Pipeline — Complete Implementation
+But the real lesson from production agents is this: the teams building Cursor, Devin, Codex, Claude Code, and Manus didn't build generic RAG pipelines. They built purpose-specific retrieval systems tuned to their exact use case. This chapter covers what they actually built.
 
-A production RAG pipeline for agentic systems has five stages. Here is the complete implementation, from raw documents to generated answers.
+## 5.2 Cursor's Semantic Codebase Index
+
+Cursor's codebase retrieval is the most mature production RAG system for coding agents. It's worth studying in detail because it solves problems that generic RAG never encounters.
+
+### The Indexing Architecture
+
+When you open a project in Cursor, it builds a semantic index of the entire codebase. The key engineering decisions:
+
+**Merkle tree-based change detection.** Rather than re-indexing the entire codebase on every change, Cursor uses a Merkle tree structure to detect which files have changed since the last index. Only changed files get re-embedded. For a 50,000-file monorepo where a typical edit touches 5 files, this means re-indexing 5 files instead of 50,000.
+
+**Simhash for index reuse across branches.** When you switch branches, most files are identical. Cursor uses simhash (locality-sensitive hashing) to detect that the new branch's index is 98% identical to the old branch's index and reuses the matching portions. This is why branch switching doesn't trigger a full re-index.
+
+**The result: time-to-first-query dropped from median 7.87 seconds to 525 milliseconds** with index reuse. For a coding agent that issues dozens of codebase searches per session, the difference between 7.87s and 525ms per query is the difference between a usable product and an unusable one.
+
+### Smart Indexing for Large Monorepos
+
+Large monorepos present a specific problem: you don't want to index `node_modules/`, `vendor/`, build outputs, or generated files. Cursor solves this with `.cursorignore` — a `.gitignore`-style file that excludes paths from indexing:
 
 ```
-┌──────────────┐     ┌──────────────┐     ┌──────────────┐
-│   Ingest &   │────▶│   Embed &    │────▶│   Store in   │
-│   Chunk      │     │   Index      │     │  Vector DB   │
-└──────────────┘     └──────────────┘     └──────────────┘
-        │                                        │
-        │            ┌──────────────┐             │
-        │            │  Retrieve &  │◀────────────┘
-        │            │  Rerank      │
-        │            └──────┬───────┘
-        │                   │
-        │            ┌──────▼───────┐
-        │            │   Generate   │
-        │            │   Response   │
-        │            └──────────────┘
-        │
-        ▼
-  ┌──────────────┐
-  │  Evaluate    │
-  │  (Ragas)     │
-  └──────────────┘
+# .cursorignore
+node_modules/
+dist/
+build/
+*.generated.ts
+vendor/
+__pycache__/
+*.min.js
 ```
 
-### Stage 1: Chunking — The Most Impactful Decision
+This is a deceptively important feature. Without it, embedding searches return matches from `node_modules/` copies of your dependencies — semantically similar to your query but completely useless for understanding your codebase. The `.cursorignore` file is Cursor's equivalent of a retrieval quality filter applied at index time rather than query time.
 
-Chunking strategy determines 60–70% of your retrieval quality. The wrong chunks poison everything downstream. Here are four production implementations.
+### What Cursor Actually Retrieves
 
-#### Fixed-Size Chunking
+When you ask Cursor to edit code, it doesn't just embed your query and search. The retrieval pipeline combines multiple signals:
 
-The simplest approach. Split text at a fixed token count with overlap.
+1. **Semantic search**: Embedding-based similarity against the codebase index
+2. **Recent file context**: Files you've recently opened or edited get a relevance boost
+3. **Import/dependency graph**: If you're editing `auth.ts`, files that import or are imported by `auth.ts` are more relevant than random semantically-similar files
+4. **File path matching**: Queries mentioning "auth" boost files with "auth" in their path
+5. **Linter and type error context**: Files with active errors related to the current edit are pulled in automatically
+
+The combination matters. Pure semantic search on a codebase returns too many false positives — code about "authentication" might match a query about "authorization" because the embeddings are close. Adding structural signals (imports, recency, path) dramatically improves precision.
+
+### The 46.9% Token Reduction
+
+Cursor's dynamic loading approach — pulling in only the files and definitions needed for a specific edit, rather than preloading everything that might be relevant — achieved a 46.9% reduction in input tokens in production A/B tests while maintaining the same code quality. This is the empirical proof that intelligent retrieval beats brute-force context filling.
+
+## 5.3 Devin's DeepWiki: Auto-Generated Documentation as Knowledge Base
+
+Cognition took a different approach to knowledge retrieval. Instead of building a codebase index that the agent queries at inference time, they pre-generate comprehensive documentation for repositories and serve it as context.
+
+**DeepWiki** auto-generates documentation for any GitHub repository. When Devin starts working on a codebase, it can pull in DeepWiki documentation that explains the project's architecture, key modules, conventions, and patterns — without reading every file.
+
+This inverts the typical RAG flow. Instead of **query → embed → search → retrieve chunks**, it's **pre-process → generate docs → load relevant sections**. The advantage: generated documentation is already coherent, summarized, and organized by topic. Raw code chunks from embedding search often lack the surrounding context needed to understand them.
+
+### Devin's Knowledge System
+
+Beyond DeepWiki, Devin has a persistent Knowledge system that accumulates context across sessions:
+
+- **Persistent tips and docs** recalled across all future sessions — not just the current one
+- **Auto-suggested additions**: "Devin will automatically suggest new additions to Knowledge" based on what it learns during conversations
+- **Manual curation**: Users can add, review, and organize knowledge entries in settings
+- **Search and folder organization** with deduplication
+
+This is a knowledge base that grows with use. The first time Devin works on your project, it relies on DeepWiki and whatever context you provide. By the 50th session, it has accumulated project-specific tips, conventions, and debugging patterns that make it substantially faster.
+
+## 5.4 Codex's Docs Directory: Knowledge as Repository Content
+
+OpenAI Codex takes the most pragmatic approach: **the knowledge base is the repository itself.**
+
+Codex encourages a structured `docs/` directory:
+
+```
+docs/
+├── index.md              # Table of contents, overview
+├── architecture.md       # System design, key decisions
+├── api-contracts.md      # API specifications
+├── testing-strategy.md   # How to write and run tests
+└── deployment.md         # Deployment procedures
+```
+
+Each document is a design doc with verification status — not auto-generated, but human-written and maintained as part of the codebase. The `index.md` serves as an entry point that the agent reads first to understand what documentation exists and where to find specific information.
+
+The `AGENTS.md` file sits at the repository root and acts as a table of contents (~100 lines) pointing the agent to relevant docs, skills, and conventions. This is retrievable without any embedding infrastructure — the agent just reads files from disk.
+
+**Why this works for Codex's use case:** Codex agents run in sandboxed containers with full filesystem access. Reading a markdown file is a zero-latency operation. There's no need for vector search when the knowledge base is small enough to navigate by filename and the agent can read any file in milliseconds.
+
+## 5.5 Anthropic's Dynamic Tool Discovery
+
+Claude Code and Anthropic's agent framework solve a different retrieval problem: not "which files are relevant?" but "which tools are relevant?"
+
+A production agent might have access to 40+ tools, but any given turn needs only 2-3. Loading all 40 tool schemas into the context costs ~35,000 tokens — a significant fraction of the window consumed by tool definitions the model won't use this turn.
+
+Anthropic's `tool_search` implements production-grade dynamic tool discovery:
 
 ```python
-from typing import List
-
-def fixed_size_chunk(
-    text: str,
-    chunk_size: int = 300,
-    chunk_overlap: int = 50,
-    encoding_name: str = "cl100k_base"
-) -> List[str]:
-    """
-    Split text into fixed-size token chunks with overlap.
-    Production sweet spot: chunk_size=300, overlap=50.
-    """
-    import tiktoken
-    enc = tiktoken.get_encoding(encoding_name)
-    tokens = enc.encode(text)
-    chunks = []
-    start = 0
-    while start < len(tokens):
-        end = min(start + chunk_size, len(tokens))
-        chunk_tokens = tokens[start:end]
-        chunks.append(enc.decode(chunk_tokens))
-        start += chunk_size - chunk_overlap
-    return chunks
+tools = [
+    {
+        "name": "read_file",
+        "description": "Read contents of a file",
+        # ... full schema
+    },
+    {
+        "name": "web_search",
+        "description": "Search the web",
+        "defer_loading": True,  # schema excluded from prompt
+        # ... full schema loaded only when tool is selected
+    },
+    # ... 38 more tools, most with defer_loading: True
+]
 ```
 
-**When to use:** Logs, transcripts, unstructured text with no clear section boundaries. Fast, predictable, easy to debug.
+The `defer_loading: True` flag is the key mechanism. Tools marked with this flag have their full schemas excluded from the prompt. Instead, only the tool name and description are included (a few tokens each). When the model decides it needs a deferred tool, the framework loads the full schema for just that tool.
 
-**Failure mode:** Splits mid-sentence, mid-paragraph, even mid-word. Overlap mitigates but doesn't eliminate this. Always combine with sentence-boundary snapping in production:
+**The result: 85% token reduction** in tool definition overhead. From ~35,000 tokens for all 40 tool schemas down to ~5,000 tokens for names/descriptions plus the 1-2 full schemas actually needed this turn.
 
-```python
-import re
+This is retrieval applied to the agent's own capabilities, not to external knowledge. It's the same principle — load only what's needed for this inference call — applied to a different content type.
 
-def snap_to_sentence_boundary(text: str, chunk_size: int = 300) -> List[str]:
-    sentences = re.split(r'(?<=[.!?])\s+', text)
-    chunks, current_chunk, current_len = [], [], 0
+## 5.6 Manus's Approach: The File System Is the Knowledge Base
 
-    for sentence in sentences:
-        sentence_len = len(sentence.split())
-        if current_len + sentence_len > chunk_size and current_chunk:
-            chunks.append(" ".join(current_chunk))
-            overlap_sentences = current_chunk[-2:]  # keep last 2 sentences
-            current_chunk = overlap_sentences
-            current_len = sum(len(s.split()) for s in current_chunk)
-        current_chunk.append(sentence)
-        current_len += sentence_len
+The Manus team built their knowledge management around a simple insight: **anything saved to the file system can be dropped from context and re-fetched on demand.**
 
-    if current_chunk:
-        chunks.append(" ".join(current_chunk))
-    return chunks
+When a Manus agent browses a web page, it saves the page content to a local file. The page content is then dropped from the conversation context — it's no longer taking up tokens. If the agent needs that information later, it reads the file. This turns the file system into an infinite-capacity, zero-cost-at-rest knowledge store.
+
+The pattern extends beyond web pages:
+- **URLs saved → pages dropped from context → re-fetchable on demand**
+- **Tool outputs saved to files → summaries kept in context → full output recoverable**
+- **Intermediate computations written to scratch files → context cleared → results accessible**
+
+This is the most infrastructure-light approach to knowledge management. No vector database, no embedding pipeline, no retrieval ranking. Just files on disk with the agent deciding what to keep in context and what to offload.
+
+## 5.7 Claude Code's CLAUDE.md Hierarchy
+
+Claude Code treats project instructions as a hierarchical knowledge base. The `CLAUDE.md` file system provides layered context that's loaded automatically based on what the agent is working on:
+
+```
+/etc/claude-code/CLAUDE.md           # Enterprise-wide rules
+~/.claude/CLAUDE.md                  # User preferences
+./CLAUDE.md                          # Project root conventions
+./src/CLAUDE.md                      # Source-specific patterns
+./src/api/CLAUDE.md                  # API-specific patterns
 ```
 
-#### Semantic Chunking
+Each level can override the previous. Enterprise rules set the baseline, user preferences customize behavior, and project/directory-specific files provide domain knowledge. When the agent is editing a file in `./src/api/`, it automatically loads the relevant `CLAUDE.md` files from each level of the hierarchy.
 
-Split at topic boundaries detected by embedding similarity. When consecutive sentences diverge in embedding space, that's a chunk boundary.
+This is knowledge retrieval by convention — no search, no embeddings, just filesystem hierarchy. It works because the knowledge is organized by *where the agent is working*, which is a strong signal for *what the agent needs to know*.
 
-```python
-from sentence_transformers import SentenceTransformer
-import numpy as np
-from typing import List
+## 5.8 OpenClaw's QMD: BM25 Over Your Workspace
 
-def semantic_chunk(
-    text: str,
-    similarity_threshold: float = 0.75,
-    min_chunk_size: int = 100,
-    max_chunk_size: int = 500,
-    model_name: str = "all-MiniLM-L6-v2"
-) -> List[str]:
-    """
-    Split text at semantic boundaries using embedding similarity.
-    Threshold 0.75 works well for technical docs; lower (0.6) for
-    narrative text with gradual topic shifts.
-    """
-    model = SentenceTransformer(model_name)
-    sentences = [s.strip() for s in text.split(". ") if s.strip()]
-    if len(sentences) < 2:
-        return [text]
+OpenClaw (an open-source Claude Code alternative) implements QMD — Query Markdown Documents. It's a BM25 keyword search over the workspace that runs in sub-second time with zero ML infrastructure.
 
-    embeddings = model.encode(sentences, show_progress_bar=False)
+The approach: index all markdown files in the workspace using standard BM25 (term frequency-inverse document frequency). When the agent needs to find relevant documentation, it queries using keywords from the current task.
 
-    chunks, current_chunk = [], [sentences[0]]
-    current_len = len(sentences[0].split())
+**Why BM25 works here:** For technical documentation, keyword matching is surprisingly effective. When the agent is debugging an "authentication timeout," searching for "authentication timeout" in BM25 will find the exact document about auth timeout configuration. Semantic search might also return documents about "session expiry" or "token refresh" — semantically related but not what's needed.
 
-    for i in range(1, len(sentences)):
-        sim = np.dot(embeddings[i], embeddings[i - 1]) / (
-            np.linalg.norm(embeddings[i]) * np.linalg.norm(embeddings[i - 1])
-        )
-        sentence_len = len(sentences[i].split())
+QMD demonstrates an important principle: **you don't need embeddings for every retrieval problem.** Keyword search is fast, predictable, debuggable, and requires no GPU infrastructure. For structured documentation where terminology is consistent, it often outperforms semantic search.
 
-        if (sim < similarity_threshold and current_len >= min_chunk_size) \
-                or current_len + sentence_len > max_chunk_size:
-            chunks.append(". ".join(current_chunk) + ".")
-            current_chunk = [sentences[i]]
-            current_len = sentence_len
-        else:
-            current_chunk.append(sentences[i])
-            current_len += sentence_len
+The implementation is intentionally minimal: standard BM25 indexing over all `.md` files in the workspace, re-indexed on file change. No vector database, no embedding model, no GPU. The entire retrieval system runs on CPU in sub-second latency. For teams that want knowledge retrieval without infrastructure complexity, QMD is the existence proof that it's possible.
 
-    if current_chunk:
-        chunks.append(". ".join(current_chunk) + ".")
-    return chunks
-```
+## 5.9 Manus's URL Lifecycle
 
-**When to use:** Technical documentation, research papers, articles with clear topic boundaries.
+To understand how Manus's file system approach works in practice, consider the lifecycle of a web page:
 
-**Failure mode:** Slow on large documents (O(n) embedding calls). Batch embedding calls. The `all-MiniLM-L6-v2` model runs at ~14,000 sentences/sec on GPU, ~2,000/sec on CPU. For documents over 10K sentences, use fixed-size as a pre-split before semantic refinement.
+1. **Agent browses URL** → Full page content enters the context (~5K-20K tokens)
+2. **Agent extracts key information** → Saves summary + raw page to local file (~1 minute)
+3. **Agent drops page from context** → Tokens freed for other work
+4. **Agent needs page info later** → Reads the saved file (milliseconds, zero API cost)
+5. **File accumulates across sessions** → Becomes part of the project's knowledge base
 
-#### Recursive Chunking (LangChain)
+This creates an interesting property: the agent's knowledge base grows as a *side effect of doing work*. There's no separate "indexing" step. Every page the agent visits, every tool output it saves, every intermediate result it writes to disk becomes retrievable knowledge for future turns or sessions.
 
-LangChain's `RecursiveCharacterTextSplitter` tries a hierarchy of separators, falling back to smaller units when chunks are too large.
+The limitation is organization — files accumulate without structure unless the agent explicitly organizes them. Manus addresses this by having the agent maintain an index file that maps topics to saved files, functioning as a manually-maintained search index.
+
+## 5.10 If You Need Classic RAG: A Practical Baseline
+
+Not every system can follow the patterns above. If you're building a knowledge base from unstructured documents where the agent doesn't control the file system, here's the production baseline.
+
+### Chunking
+
+The single most impactful decision. Use code-aware chunking (tree-sitter) for code, recursive chunking for hierarchical documents, and 200-400 token chunks with 50-token overlap for everything else.
 
 ```python
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 
 splitter = RecursiveCharacterTextSplitter(
-    chunk_size=400,            # target tokens (roughly 4 chars/token)
-    chunk_overlap=50,
-    separators=[
-        "\n\n",                # paragraph boundaries first
-        "\n",                  # then line breaks
-        ". ",                  # then sentences
-        ", ",                  # then clauses
-        " ",                   # then words
-        ""                     # last resort: characters
-    ],
-    length_function=len,       # replace with tiktoken for token-accurate counting
-    is_separator_regex=False,
-)
-
-chunks = splitter.split_text(document_text)
-```
-
-**When to use:** Hierarchical documents (markdown docs, structured reports). The separator hierarchy respects document structure naturally.
-
-**Production tip:** Replace `length_function=len` with a token counter for accurate sizing:
-
-```python
-import tiktoken
-
-enc = tiktoken.get_encoding("cl100k_base")
-splitter = RecursiveCharacterTextSplitter(
     chunk_size=400,
     chunk_overlap=50,
-    length_function=lambda text: len(enc.encode(text)),
+    separators=["\n\n", "\n", ". ", ", ", " ", ""],
 )
 ```
 
-#### Code-Aware Chunking (tree-sitter)
+### Hybrid Search + Reranking
 
-For codebases, splitting at function and class boundaries preserves semantic units. Tree-sitter parses the AST and identifies natural split points.
-
-```python
-import tree_sitter_python as tspython
-from tree_sitter import Language, Parser
-from typing import List, Tuple
-
-PY_LANGUAGE = Language(tspython.language())
-
-def code_aware_chunk(
-    source_code: str,
-    max_chunk_tokens: int = 400
-) -> List[dict]:
-    """
-    Split Python source at function/class boundaries using tree-sitter.
-    Returns chunks with metadata (name, type, line range).
-    """
-    parser = Parser(PY_LANGUAGE)
-    tree = parser.parse(bytes(source_code, "utf-8"))
-
-    chunks = []
-    splittable_types = {"function_definition", "class_definition", "decorated_definition"}
-
-    def walk(node):
-        if node.type in splittable_types:
-            text = source_code[node.start_byte:node.end_byte]
-            name_node = node.child_by_field_name("name")
-            name = source_code[name_node.start_byte:name_node.end_byte] if name_node else "anonymous"
-            chunks.append({
-                "text": text,
-                "name": name,
-                "type": node.type,
-                "start_line": node.start_point[0] + 1,
-                "end_line": node.end_point[0] + 1,
-            })
-        else:
-            for child in node.children:
-                walk(child)
-
-    walk(tree.root_node)
-
-    # Handle top-level code not inside functions/classes
-    covered = set()
-    for chunk in chunks:
-        for line in range(chunk["start_line"], chunk["end_line"] + 1):
-            covered.add(line)
-
-    lines = source_code.split("\n")
-    uncovered = []
-    for i, line in enumerate(lines, 1):
-        if i not in covered and line.strip():
-            uncovered.append(line)
-
-    if uncovered:
-        chunks.insert(0, {
-            "text": "\n".join(uncovered),
-            "name": "module_level",
-            "type": "module",
-            "start_line": 0,
-            "end_line": 0,
-        })
-    return chunks
-```
-
-**When to use:** Any codebase RAG system. Functions and classes are natural semantic units — splitting mid-function destroys context the model needs for understanding.
-
-**Failure mode:** Very large functions (500+ lines) still need sub-splitting. Add a fallback that recursively splits large functions at method-level or block-level boundaries.
-
-### Stage 2: Embedding — Model Selection
-
-| Model | Dimensions | Cost | Speed (tokens/sec) | Quality (MTEB avg) | Best For |
-|-------|-----------|------|--------------------|--------------------|----------|
-| `text-embedding-3-small` | 1536 | $0.02/M tokens | ~62,500 | 62.3 | Production default. Best cost/quality ratio |
-| `text-embedding-3-large` | 3072 | $0.13/M tokens | ~9,100 | 64.6 | When 2% accuracy gain justifies 6.5× cost |
-| BGE-M3 (BAAI) | 1024 | Free (local) | ~3,000 (GPU) | 63.5 | Air-gapped, multilingual, budget-zero |
-| Cohere embed-v3 | 1024 | $0.10/M tokens | ~10,000 | 64.5 | Cohere ecosystem, built-in search types |
-
-**Production embedding code:**
-
-```python
-from openai import OpenAI
-from typing import List
-import numpy as np
-
-client = OpenAI()
-
-def embed_chunks(
-    chunks: List[str],
-    model: str = "text-embedding-3-small",
-    batch_size: int = 100
-) -> np.ndarray:
-    """
-    Embed chunks in batches. OpenAI limits to 8191 tokens per text
-    and ~2048 texts per batch. We use 100 for safety.
-    """
-    all_embeddings = []
-    for i in range(0, len(chunks), batch_size):
-        batch = chunks[i:i + batch_size]
-        response = client.embeddings.create(
-            input=batch,
-            model=model,
-            dimensions=1536,   # can reduce to 512 or 256 for cost savings
-        )
-        batch_embeddings = [item.embedding for item in response.data]
-        all_embeddings.extend(batch_embeddings)
-    return np.array(all_embeddings)
-```
-
-**Dimension reduction trick:** `text-embedding-3-small` supports native dimension reduction. Dropping from 1536 to 512 dimensions reduces storage by 3× with only ~1% quality loss on most benchmarks. Set `dimensions=512` in the API call.
-
-### Stage 3: Vector Database Selection
-
-| Database | Hybrid Search | Filtering | Latency (p99, 1M vectors) | Ops Burden | Best For |
-|----------|--------------|-----------|---------------------------|------------|----------|
-| Qdrant | Native (sparse + dense) | Payload filters | <15ms | Medium (self-host) or low (cloud) | Production agentic RAG |
-| ChromaDB | Manual (via BM25 add-on) | Metadata filters | <50ms (100K) | Zero | Dev/prototype, single-node |
-| pgvector | Via `pg_search` + tsvector | Full SQL WHERE | <30ms (with IVFFlat) | Low (existing PG stack) | Teams already on Postgres |
-| Pinecone | Native | Metadata filters | <20ms | Zero (managed) | Managed, budget-flexible |
-| Weaviate | Native (BM25 + vector) | GraphQL filters | <25ms | Medium | GraphQL-native stacks |
-
-**Qdrant production setup:**
-
-```python
-from qdrant_client import QdrantClient
-from qdrant_client.models import (
-    VectorParams, Distance, PointStruct,
-    SparseVectorParams, SparseIndexParams,
-    NamedVector, NamedSparseVector, SparseVector,
-    SearchRequest, Filter, FieldCondition, MatchValue,
-)
-
-client = QdrantClient(url="http://localhost:6333")
-
-# Create collection with both dense and sparse vectors for hybrid search
-client.create_collection(
-    collection_name="knowledge_base",
-    vectors_config={
-        "dense": VectorParams(
-            size=1536,
-            distance=Distance.COSINE,
-            on_disk=True,           # keep vectors on disk for large collections
-        )
-    },
-    sparse_vectors_config={
-        "sparse": SparseVectorParams(
-            index=SparseIndexParams(on_disk=True)
-        )
-    },
-    optimizers_config={
-        "indexing_threshold": 20000,  # build HNSW after 20K points
-    },
-)
-```
-
-### Stage 4: Hybrid Search + Reranking
-
-Vector search alone misses exact terminology. BM25 alone misses semantic similarity. Combine them with Reciprocal Rank Fusion (RRF).
-
-```python
-from qdrant_client.models import Prefetch, FusionQuery, Fusion
-
-def hybrid_search(
-    client: QdrantClient,
-    query_text: str,
-    query_embedding: list[float],
-    query_sparse_vector: SparseVector,
-    collection: str = "knowledge_base",
-    top_k: int = 10
-) -> list:
-    """
-    Hybrid search: dense vector + BM25 sparse vector, fused with RRF.
-    """
-    results = client.query_points(
-        collection_name=collection,
-        prefetch=[
-            Prefetch(
-                query=query_embedding,
-                using="dense",
-                limit=20,
-            ),
-            Prefetch(
-                query=query_sparse_vector,
-                using="sparse",
-                limit=20,
-            ),
-        ],
-        query=FusionQuery(fusion=Fusion.RRF),  # Reciprocal Rank Fusion
-        limit=top_k,
-    )
-    return results.points
-```
-
-**Manual RRF when your DB doesn't support native fusion:**
+Vector search alone misses exact terminology. BM25 alone misses semantic similarity. Combine them with Reciprocal Rank Fusion:
 
 ```python
 def reciprocal_rank_fusion(
     ranked_lists: list[list[str]],
     k: int = 60
 ) -> list[tuple[str, float]]:
-    """
-    Reciprocal Rank Fusion. k=60 is standard from the original paper.
-    Each ranked_list is a list of document IDs in ranked order.
-    """
     scores = {}
     for ranked_list in ranked_lists:
         for rank, doc_id in enumerate(ranked_list, start=1):
@@ -406,390 +219,52 @@ def reciprocal_rank_fusion(
     return sorted(scores.items(), key=lambda x: x[1], reverse=True)
 ```
 
-**Cross-encoder reranking — the 15–20% accuracy boost:**
+Then rerank the top 20 candidates with a cross-encoder to get the top 5. Cross-encoder reranking adds 15-20% accuracy with ~80ms latency on CPU.
 
-```python
-from sentence_transformers import CrossEncoder
+### Production Defaults
 
-reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-12-v2", max_length=512)
-
-def rerank(query: str, documents: list[str], top_k: int = 5) -> list[tuple[int, float]]:
-    """
-    Rerank documents using a cross-encoder. Returns (index, score) pairs
-    sorted by relevance. The cross-encoder sees query+document together,
-    giving it much richer interaction features than bi-encoder similarity.
-    """
-    pairs = [[query, doc] for doc in documents]
-    scores = reranker.predict(pairs)
-    ranked = sorted(enumerate(scores), key=lambda x: x[1], reverse=True)
-    return ranked[:top_k]
-
-# Usage in pipeline:
-# 1. Hybrid search returns 20 candidates
-# 2. Reranker narrows to top 5 with much higher precision
-candidates = hybrid_search(client, query, embedding, sparse_vec, top_k=20)
-candidate_texts = [c.payload["text"] for c in candidates]
-top_5 = rerank(query, candidate_texts, top_k=5)
-final_context = [candidate_texts[idx] for idx, score in top_5]
-```
-
-**Reranker latency budget:** `ms-marco-MiniLM-L-12-v2` processes 20 pairs in ~15ms on GPU, ~80ms on CPU. Budget 100ms for reranking in your pipeline. If latency is tight, rerank top 10 instead of top 20 — the quality difference is <2%.
-
-### Stage 5: Generation with Grounding
-
-```python
-def generate_grounded_response(
-    client: OpenAI,
-    query: str,
-    context_chunks: list[str],
-    model: str = "gpt-4o"
-) -> str:
-    context = "\n\n---\n\n".join(
-        f"[Source {i+1}]\n{chunk}" for i, chunk in enumerate(context_chunks)
-    )
-    response = client.chat.completions.create(
-        model=model,
-        temperature=0.1,       # low temp for factual grounding
-        messages=[
-            {
-                "role": "system",
-                "content": (
-                    "Answer the user's question using ONLY the provided context. "
-                    "Cite sources as [Source N]. If the context does not contain "
-                    "sufficient information, state: 'The available context does not "
-                    "contain enough information to answer this question.'"
-                ),
-            },
-            {
-                "role": "user",
-                "content": f"Context:\n{context}\n\nQuestion: {query}",
-            },
-        ],
-    )
-    return response.choices[0].message.content
-```
-
-## 5.3 Agentic RAG — The Agent Controls Retrieval
-
-Traditional RAG retrieves on every query. Agentic RAG wraps the retrieval pipeline in an intelligent control loop where the agent decides *whether*, *what*, and *how much* to retrieve.
-
-Three production patterns have emerged. Here is the most important one implemented end-to-end.
-
-### Corrective RAG (CRAG) — Full LangGraph Implementation
-
-CRAG adds a grading loop: retrieve → grade relevance → if poor, rewrite query → re-retrieve → generate. This is the highest-ROI agentic RAG pattern because it catches the #1 RAG failure mode: irrelevant retrieval.
-
-```
-┌─────────┐     ┌──────────┐     ┌───────────────┐
-│  Query   │────▶│ Retrieve │────▶│ Grade Chunks  │
-└─────────┘     └──────────┘     └───────┬───────┘
-                                         │
-                              ┌──────────┴──────────┐
-                              │                     │
-                        Relevant?              Not Relevant?
-                              │                     │
-                              ▼                     ▼
-                       ┌────────────┐       ┌──────────────┐
-                       │  Generate  │       │ Rewrite Query │
-                       └────────────┘       └──────┬───────┘
-                                                   │
-                                            ┌──────▼───────┐
-                                            │  Re-Retrieve  │
-                                            └──────┬───────┘
-                                                   │
-                                            ┌──────▼───────┐
-                                            │   Generate    │
-                                            └──────────────┘
-```
-
-```python
-from typing import TypedDict, Literal
-from langgraph.graph import StateGraph, END
-
-class CRAGState(TypedDict):
-    query: str
-    documents: list[str]
-    generation: str
-    relevance_grade: str
-    rewrite_count: int
-
-def retrieve(state: CRAGState) -> CRAGState:
-    """Retrieve documents using hybrid search + reranking."""
-    query = state["query"]
-    # Your retrieval pipeline here (hybrid search + rerank)
-    docs = run_retrieval_pipeline(query, top_k=5)
-    return {**state, "documents": docs}
-
-def grade_relevance(state: CRAGState) -> CRAGState:
-    """Use an LLM to grade whether retrieved docs answer the query."""
-    from openai import OpenAI
-    client = OpenAI()
-
-    docs_text = "\n\n".join(state["documents"])
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",     # cheap model for grading
-        temperature=0.0,
-        messages=[
-            {
-                "role": "system",
-                "content": (
-                    "You are a relevance grader. Given a query and retrieved documents, "
-                    "respond with exactly 'relevant' if the documents contain information "
-                    "that can answer the query, or 'not_relevant' if they do not."
-                ),
-            },
-            {
-                "role": "user",
-                "content": f"Query: {state['query']}\n\nDocuments:\n{docs_text}",
-            },
-        ],
-    )
-    grade = response.choices[0].message.content.strip().lower()
-    return {**state, "relevance_grade": grade}
-
-def rewrite_query(state: CRAGState) -> CRAGState:
-    """Rewrite the query for better retrieval."""
-    from openai import OpenAI
-    client = OpenAI()
-
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        temperature=0.7,         # higher temp for creative rewrites
-        messages=[
-            {
-                "role": "system",
-                "content": (
-                    "Rewrite the following query to be more specific and "
-                    "retrieve better results. Output only the rewritten query."
-                ),
-            },
-            {"role": "user", "content": state["query"]},
-        ],
-    )
-    new_query = response.choices[0].message.content.strip()
-    return {
-        **state,
-        "query": new_query,
-        "rewrite_count": state.get("rewrite_count", 0) + 1,
-    }
-
-def generate(state: CRAGState) -> CRAGState:
-    """Generate final answer from retrieved context."""
-    answer = generate_grounded_response(
-        OpenAI(), state["query"], state["documents"]
-    )
-    return {**state, "generation": answer}
-
-def should_rewrite(state: CRAGState) -> Literal["rewrite", "generate"]:
-    if state["relevance_grade"] == "not_relevant" and state.get("rewrite_count", 0) < 2:
-        return "rewrite"
-    return "generate"
-
-# Build the graph
-graph = StateGraph(CRAGState)
-graph.add_node("retrieve", retrieve)
-graph.add_node("grade", grade_relevance)
-graph.add_node("rewrite", rewrite_query)
-graph.add_node("generate", generate)
-
-graph.set_entry_point("retrieve")
-graph.add_edge("retrieve", "grade")
-graph.add_conditional_edges("grade", should_rewrite, {
-    "rewrite": "rewrite",
-    "generate": "generate",
-})
-graph.add_edge("rewrite", "retrieve")
-graph.add_edge("generate", END)
-
-crag_chain = graph.compile()
-
-# Run
-result = crag_chain.invoke({
-    "query": "How does the auth middleware handle expired tokens?",
-    "documents": [],
-    "generation": "",
-    "relevance_grade": "",
-    "rewrite_count": 0,
-})
-```
-
-**Critical detail:** Cap rewrites at 2 (`rewrite_count < 2`). Without this, irretrievable queries loop forever. After 2 rewrites, generate with whatever context you have and let the grounding prompt handle the "insufficient information" case.
-
-### Self-RAG
-
-Self-RAG generates first, then self-evaluates. If the generation isn't well-supported by context, it identifies gaps and retrieves more.
-
-```
-Query → Retrieve → Generate → Self-Evaluate → [Supported: Return]
-                                              → [Gaps found: Retrieve for gaps → Re-generate]
-```
-
-Use Self-RAG when generation quality matters more than latency. It adds one extra LLM call for evaluation but catches hallucination before it reaches the user.
-
-### Adaptive RAG
-
-A router classifies query complexity and selects the pipeline:
-
-```python
-def route_query(query: str) -> str:
-    """Route by estimated complexity. Uses keyword heuristics + LLM fallback."""
-    simple_patterns = ["what is", "define", "list the"]
-    if any(query.lower().startswith(p) for p in simple_patterns) and len(query.split()) < 10:
-        return "direct"        # no retrieval needed
-
-    complex_signals = ["compare", "how does X interact with Y", "debug", "analyze"]
-    if any(signal in query.lower() for signal in complex_signals):
-        return "multi_step"    # decompose → retrieve per sub-question → synthesize
-
-    return "single_pass"       # standard retrieve → generate
-```
-
-## 5.4 Evaluation with Ragas — Measuring Retrieval and Generation
-
-You cannot improve what you do not measure. Most teams evaluate answer quality but never measure retrieval quality. If the wrong chunks are retrieved, no model can produce a correct answer.
-
-```python
-from ragas import evaluate
-from ragas.metrics import (
-    faithfulness,
-    answer_relevancy,
-    context_precision,
-    context_recall,
-)
-from datasets import Dataset
-
-eval_dataset = Dataset.from_dict({
-    "question": [
-        "How does the auth middleware handle expired tokens?",
-        "What is the retry policy for failed API calls?",
-    ],
-    "answer": [
-        "The auth middleware checks JWT expiry and returns 401...",
-        "Failed API calls are retried 3 times with exponential backoff...",
-    ],
-    "contexts": [
-        ["The AuthMiddleware class validates JWT tokens...",
-         "When a token is expired, the middleware returns..."],
-        ["The RetryPolicy class implements exponential backoff...",
-         "Maximum retries is configured to 3 in config.yaml..."],
-    ],
-    "ground_truth": [
-        "The auth middleware validates JWT expiry timestamps and returns HTTP 401...",
-        "The system retries failed API calls up to 3 times using exponential backoff...",
-    ],
-})
-
-results = evaluate(
-    dataset=eval_dataset,
-    metrics=[
-        faithfulness,          # does the answer only use retrieved info?
-        answer_relevancy,      # does the answer address the question?
-        context_precision,     # are retrieved chunks actually relevant?
-        context_recall,        # are all relevant chunks retrieved?
-    ],
-)
-
-print(results)
-# {'faithfulness': 0.92, 'answer_relevancy': 0.89,
-#  'context_precision': 0.85, 'context_recall': 0.78}
-```
-
-**Metric targets for production agentic RAG:**
-
-| Metric | Target | Action if Below |
-|--------|--------|-----------------|
-| `context_recall` | >0.80 | Improve chunking, add hybrid search, tune chunk size |
-| `context_precision` | >0.75 | Add reranking, tune retrieval top_k, improve metadata filters |
-| `faithfulness` | >0.90 | Strengthen grounding prompt, lower temperature, add citation enforcement |
-| `answer_relevancy` | >0.85 | Improve query understanding, add query rewriting |
-
-**The single most important metric is `context_recall@5`.** If the right chunks don't appear in your top 5 retrieval results, everything else fails. Measure this first, optimize this first.
-
-## 5.5 Knowledge Base Architecture for Agents
-
-### Layered Knowledge Design
-
-```
-┌─────────────────────────────────────────────┐
-│           Ephemeral Layer                    │
-│   Session context, in-progress work,        │
-│   scratch notes. Lives in agent memory.     │
-│   Lifetime: single session                  │
-├─────────────────────────────────────────────┤
-│           Operational Layer                  │
-│   Current configs, recent decisions,        │
-│   active project state. Re-index daily.     │
-│   Lifetime: days to weeks                   │
-├─────────────────────────────────────────────┤
-│           Core Static Layer                  │
-│   Architecture docs, API specs, compliance  │
-│   texts. Re-index on version change.        │
-│   Lifetime: months to permanent             │
-└─────────────────────────────────────────────┘
-```
-
-Each layer has different freshness requirements:
-
-| Layer | Index Frequency | Chunk Size | Overlap | Embedding Model |
-|-------|----------------|------------|---------|-----------------|
-| Core static | On release/version change | 300–400 tokens | 50 | `text-embedding-3-small` (1536d) |
-| Operational | Daily or on-change webhook | 200–300 tokens | 30 | `text-embedding-3-small` (512d) |
-| Ephemeral | Real-time (in-memory) | 100–200 tokens | 0 | `all-MiniLM-L6-v2` (local, fast) |
-
-### Content Weighting with Metadata Boosting
-
-Not all knowledge is equally relevant. Attach priority metadata and boost at query time:
-
-```python
-def boosted_search(
-    client: QdrantClient,
-    query_embedding: list[float],
-    priority: str = "any",
-    top_k: int = 5,
-) -> list:
-    filter_condition = None
-    if priority != "any":
-        filter_condition = Filter(must=[
-            FieldCondition(key="priority", match=MatchValue(value=priority))
-        ])
-
-    results = client.search(
-        collection_name="knowledge_base",
-        query_vector=("dense", query_embedding),
-        query_filter=filter_condition,
-        limit=top_k,
-        score_threshold=0.7,    # drop low-confidence results
-    )
-    return results
-```
-
-## 5.6 Production Checklist
-
-| Item | Setting | Rationale |
-|------|---------|-----------|
+| Setting | Value | Rationale |
+|---------|-------|-----------|
 | Chunk size | 200–400 tokens | Smaller loses context; larger dilutes relevance |
 | Chunk overlap | 50 tokens | Preserves cross-boundary continuity |
-| Embedding model | `text-embedding-3-small` | Best cost/quality. $0.02/M tokens |
-| Embedding dimensions | 1536 (or 512 for budget) | 512 loses ~1%, saves 3× storage |
-| Vector DB | Qdrant (production), ChromaDB (dev) | Qdrant: native hybrid search, scales to 100M+ |
-| Retrieval top_k | 20 (pre-rerank) → 5 (post-rerank) | Over-retrieve then precision-filter |
-| Reranker | `cross-encoder/ms-marco-MiniLM-L-12-v2` | 15–20% accuracy boost, <100ms latency |
-| Hybrid search | Vector + BM25 with RRF (k=60) | Catches both semantic and keyword matches |
-| Generation temp | 0.1 | Factual grounding needs low randomness |
-| Recall@5 target | >0.80 | Below this, retrieval is the bottleneck |
-| Faithfulness target | >0.90 | Below this, the model is hallucinating beyond context |
-| Reindex frequency | Static: on-change. Operational: daily | Stale chunks are wrong chunks |
+| Embedding | `text-embedding-3-small` | Best cost/quality at $0.02/M tokens |
+| Pre-rerank top_k | 20 | Over-retrieve then precision-filter |
+| Post-rerank top_k | 5 | Final context should be focused |
+| Hybrid search | Vector + BM25 with RRF | Catches both semantic and keyword matches |
 
-## 5.7 Key Takeaways
+## 5.11 The Pattern: Retrieval Is Not One Thing
 
-1. **RAG is not obsolete.** A focused 5K-token retrieval outperforms a 200K-token dump — in accuracy, cost, and latency. Retrieval is a quality optimization, not a size workaround.
+The most important lesson from studying production systems is that **retrieval is not a single pipeline.** Each system built retrieval differently because each had different constraints:
 
-2. **Chunking determines 60–70% of retrieval quality.** Use code-aware chunking for code, semantic chunking for docs, recursive for hierarchical content. The 200–400 token sweet spot is well-established.
+| System | Retrieval Method | Infrastructure Required | Latency | Best For |
+|--------|-----------------|------------------------|---------|----------|
+| Cursor | Semantic index + Merkle trees | Embedding model, local index | 525ms (with reuse) | Codebase navigation |
+| Devin DeepWiki | Pre-generated docs | Doc generation pipeline | Zero (pre-loaded) | Repository understanding |
+| Codex docs/ | File reads | None | Milliseconds | Small, structured knowledge |
+| Claude Code CLAUDE.md | Hierarchical file loading | None | Milliseconds | Project conventions |
+| Anthropic tool_search | Dynamic tool schema loading | None | Milliseconds | Tool discovery |
+| Manus file system | Save-to-disk, read-on-demand | None | Milliseconds | Web content, tool outputs |
+| OpenClaw QMD | BM25 keyword search | BM25 index | Sub-second | Markdown documentation |
+| Classic RAG | Vector + BM25 + rerank | Vector DB, embedding model, reranker | 100-200ms | Unstructured documents |
 
-3. **Hybrid search + reranking is the production baseline.** Vector-only misses exact terms. BM25-only misses semantics. Combine with RRF, then rerank with a cross-encoder for a 15–20% accuracy boost.
+**The decision tree for your system:**
 
-4. **CRAG is the highest-ROI agentic RAG pattern.** Grade retrieval quality, rewrite queries on poor results, cap rewrites at 2. This catches the #1 failure mode: irrelevant retrieval.
+1. **Is your knowledge base small and structured?** → File-based (Codex/Claude Code pattern). No infrastructure needed.
+2. **Is it a codebase?** → Semantic index with structural signals (Cursor pattern). Worth the infrastructure investment.
+3. **Can you pre-generate documentation?** → Pre-process and serve (DeepWiki pattern). Trades index-time compute for query-time speed.
+4. **Is it dynamic content the agent discovers during sessions?** → File system offloading (Manus pattern). Context management, not retrieval.
+5. **Is it large, unstructured, and external?** → Classic RAG with hybrid search and reranking. The full pipeline.
 
-5. **Measure `context_recall@5` first.** If the right chunks aren't in your top 5, nothing downstream can compensate. Use Ragas for systematic evaluation.
+## 5.12 Key Takeaways
 
-6. **Layer your knowledge base.** Static core (months), operational middle (days), ephemeral session (hours). Different freshness, different chunk sizes, different embedding strategies.
+1. **Production agents don't use generic RAG.** Cursor uses Merkle trees and simhash. Devin pre-generates documentation. Codex reads files from disk. Manus saves to the file system. Each built retrieval for their specific constraints.
+
+2. **Cursor's codebase index is the gold standard for code.** Merkle tree change detection + simhash index reuse dropped time-to-first-query from 7.87s to 525ms. If you're building a coding agent, study this architecture.
+
+3. **Tool discovery is a retrieval problem.** Anthropic's `defer_loading` pattern achieves 85% token reduction in tool definitions. Load tool schemas on demand, not upfront.
+
+4. **The file system is an underrated knowledge store.** Manus and Claude Code both use the file system as their primary knowledge management layer. Zero infrastructure, millisecond access, infinite capacity.
+
+5. **BM25 is not dead.** OpenClaw's QMD shows that keyword search over structured documentation often outperforms semantic search. Don't default to embeddings — match the retrieval method to the content type.
+
+6. **Retrieval quality > retrieval volume.** Cursor's 46.9% token reduction with dynamic loading while maintaining quality proves this. Five focused chunks outperform fifty diluted ones.
