@@ -1,8 +1,8 @@
 # Context Management for Long-Running LLM Agents
 
-**A Practitioner's Guide to State-of-the-Art Context Engineering**
+**How Production Agent Systems Actually Manage Context**
 
-*For those who design agents that run hard tasks over long horizons.*
+*Grounded in source code, architecture decisions, and engineering blogs — not just papers.*
 
 ---
 
@@ -10,14 +10,16 @@
 
 Large language models have a fundamental constraint: a finite context window that serves as their only working memory. For agents that must run autonomously for hours—reading codebases, debugging complex systems, orchestrating multi-step workflows—this constraint is the primary engineering challenge. Not model capability. Not reasoning ability. Context.
 
-This book is a comprehensive, research-backed guide to the emerging discipline of **context engineering**: the art and science of curating what information enters and exits an LLM's attention at each step of an agentic workflow. It draws on published research, production systems at OpenAI, Anthropic, Google, Cursor, Manus, Cognition (Devin), and leading open-source frameworks to provide actionable design patterns for building agents that maintain coherence, accumulate experience, and complete hard tasks over extended runs.
+This is a **practitioner's guide** to context engineering — built primarily from how real products work, not from academic abstractions. Every pattern in this book is grounded in production systems: the Rust source code of OpenAI's Codex harness, the TypeScript compaction engine inside Claude Code, Cursor's Merkle-tree semantic index, Devin's managed agent architecture, Manus's logit-masking state machine, and Anthropic's brain-hand-session decomposition for Managed Agents. Where research papers inform the design, we cite them. But the primary sources are **engineering blogs, open-source repositories, reverse engineering, and published technical details** from the teams building these systems.
+
+This is the guide we wished existed when we started building long-running agents: concrete architecture decisions, exact threshold values, real code paths — not conceptual overviews.
 
 ## Who This Book Is For
 
 - **Agent system architects** designing long-running autonomous agents
 - **AI engineers** building production LLM applications that exceed single-turn interactions
-- **Researchers** studying memory, retrieval, and reasoning in language model agents
 - **Technical leaders** evaluating context management strategies for their AI products
+- **Researchers** studying memory, retrieval, and reasoning in language model agents — with production grounding
 
 ## Table of Contents
 
@@ -39,14 +41,25 @@ This book is a comprehensive, research-backed guide to the emerging discipline o
 
 ## Key Sources
 
-- Chroma Research, *Context Rot: How Increasing Input Tokens Impacts LLM Performance* (2025)
-- Anthropic Engineering, *Effective Context Engineering for AI Agents* (2025)
-- Manus (Yichao Ji), *Context Engineering for AI Agents: Lessons from Building Manus* (2025)
+### Engineering Blogs & Technical Posts
 - OpenAI, *Unrolling the Codex Agent Loop* (2026); *Harness Engineering* (2026)
-- Anthropic, *Harness Design for Long-Running Application Development* (2026)
+- Anthropic Engineering, *Effective Context Engineering for AI Agents* (2025)
+- Anthropic, *Harness Design for Long-Running Application Development* (2026); *Managed Agents* (2026)
+- Manus (Yichao Ji), *Context Engineering for AI Agents: Lessons from Building Manus* (2025)
 - Cursor Engineering, *Dynamic Context Discovery* (2025)
+- Cognition (Devin), *How We Build Devin* (2025–2026)
+
+### Source Code & Repositories
+- [`openai/codex`](https://github.com/openai/codex) — Rust agent harness (`codex-rs/core`), open source
+- Claude Code — compaction engine (`compact.ts`, `autoCompact.ts`, `microCompact.ts`), hooks system
+- Cursor — `.cursor/rules/` MDC format, semantic index architecture
+- Devin — MCP server interface, DeepWiki, playbook system
+
+### Research Papers
+- Chroma Research, *Context Rot: How Increasing Input Tokens Impacts LLM Performance* (2025)
 - arXiv: *Memory for Autonomous LLM Agents* (2026), *ExpRAG* (2026), *DACS* (2026)
+- Barazany, *Claude Code Source Analysis: Compaction Engine Internals* (2026)
 
 ---
 
-*This book is a living document. Context engineering is an emerging discipline evolving with every model release and every new production system. Contributions, corrections, and updates are welcome.*
+*This book is a living document. Context engineering is an emerging discipline evolving with every model release, every new production system, and every harness rewrite. Built from how products actually work. Contributions, corrections, and updates are welcome.*

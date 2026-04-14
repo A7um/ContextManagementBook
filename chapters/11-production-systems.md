@@ -185,6 +185,124 @@ Violations are caught by:
 
 This rigid structure is what enables 6+ hour autonomous runs. The agent can't accidentally introduce architectural violations because the enforcement is mechanical, not advisory.
 
+### Surfaces and App Server
+
+Codex ships as four surfaces—CLI, Cloud, VS Code extension, and macOS app—all powered by the same Rust harness (`codex-rs/core`). The unifying layer is the **App Server**: a bidirectional JSON-RPC channel over stdio that exposes a thread manager and a Codex message processor to whatever frontend connects.
+
+```
+┌──────────────┐  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐
+│  CLI (tty)   │  │  VS Code     │  │  macOS app   │  │  Cloud       │
+│              │  │  extension   │  │  (Swift UI)  │  │  (web)       │
+└──────┬───────┘  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘
+       │                 │                 │                 │
+       └────────────┬────┴────────┬────────┘                 │
+                    ▼             ▼                           ▼
+              ┌──────────────────────────────────────────────────┐
+              │              APP SERVER (Rust)                    │
+              │  Protocol: bidirectional JSON-RPC over stdio      │
+              │  Components:                                      │
+              │    - Thread Manager (lifecycle, persistence)      │
+              │    - Codex Message Processor (agent loop)         │
+              └──────────────────────────────────────────────────┘
+```
+
+### Thread Lifecycle
+
+Every Codex session is a **thread** with a well-defined lifecycle:
+
+| Operation | What happens | Context implication |
+|-----------|-------------|---------------------|
+| **Create** | New thread, empty event history | Clean context, maximum headroom |
+| **Resume** | Reload persisted event history, continue | Full history restored—compaction may trigger |
+| **Fork** | Copy a thread's history into a new thread | Snapshot context at a point in time; original continues independently |
+| **Archive** | Mark thread inactive, persist final state | Event history available for future resume or analysis |
+
+Event history is persisted across all operations, meaning a Codex thread can be suspended, moved to a different surface (e.g., started on CLI, resumed in VS Code), and continued with full context intact.
+
+### Sandbox Modes
+
+Codex enforces three sandbox tiers, each implemented at the kernel level:
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│                      SANDBOX MODES                                │
+│                                                                  │
+│  read-only           workspace-write        danger-full-access   │
+│  ─────────           ───────────────        ──────────────────   │
+│  No writes anywhere  Writes only within     Full filesystem +    │
+│                      the project directory   network access       │
+│                                                                  │
+│  Enforcement:                                                    │
+│    macOS:  Seatbelt (sandbox-exec)                               │
+│    Linux:  Landlock LSM + seccomp-BPF                            │
+│                                                                  │
+│  Default: workspace-write                                        │
+│  Configurable per agent, per session                             │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+The kernel-level enforcement is critical: the sandbox cannot be bypassed by the model generating clever shell commands. A `read-only` Codex agent physically cannot write files, regardless of what the model attempts.
+
+### Codex as MCP Server
+
+Codex can expose itself as an MCP server via `codex mcp-server`, publishing two tools:
+
+| MCP Tool | Purpose |
+|----------|---------|
+| `codex` | Start a new Codex task—accepts a prompt, returns a thread ID |
+| `codex-reply` | Send a follow-up message to an existing thread |
+
+This enables **multi-agent workflows via the OpenAI Agents SDK**: an orchestrator agent can spawn Codex instances as MCP tool calls, each running in its own sandbox with its own context. The Agents SDK handles routing and lifecycle; Codex handles execution.
+
+```python
+# Multi-agent workflow: Agents SDK + Codex MCP
+from agents import Agent, Runner
+from agents.mcp import MCPServerStdio
+
+codex_server = MCPServerStdio(
+    name="codex",
+    command="codex",
+    args=["mcp-server"]
+)
+
+orchestrator = Agent(
+    name="orchestrator",
+    instructions="Decompose tasks and delegate to Codex workers.",
+    mcp_servers=[codex_server]
+)
+
+# The orchestrator calls `codex` tool to spawn workers,
+# `codex-reply` to send follow-ups, each in isolated context
+```
+
+### Custom Agents
+
+Codex supports custom agent definitions via TOML files stored in `~/.codex/agents/` (user-level) or `.codex/agents/` (project-level):
+
+```toml
+# .codex/agents/reviewer.toml
+model = "o3"
+model_reasoning_effort = "high"
+sandbox_mode = "read-only"
+
+[mcp_servers.lint]
+command = "npx"
+args = ["eslint-mcp-server"]
+
+[skills]
+config = "docs/review-guidelines.md"
+```
+
+Two agents are built-in:
+- **`default`** — general-purpose, balanced reasoning effort
+- **`worker`** — execution-focused, used by subagent spawning
+
+Available fields: `model`, `model_reasoning_effort`, `sandbox_mode`, `mcp_servers`, `skills.config`. Custom agents inherit defaults from `default` and override only specified fields.
+
+### Skills System
+
+Skills are bundled instructions and scripts that are **loaded on demand** rather than injected into every prompt. A skill's name and one-line description sit in the system prompt; the full content is loaded only when the model determines it's relevant—the same dynamic loading pattern described in Chapter 10.
+
 ## 11.2 Claude Code
 
 ### The Compaction Codebase
@@ -344,6 +462,144 @@ Session End
     │
     └──► Memory tool writes new facts for next session
 ```
+
+### Five Persistence Mechanisms
+
+Claude Code maintains state through five distinct persistence layers, each serving a different time horizon and granularity:
+
+| Mechanism | What it stores | Lifetime | Location |
+|-----------|---------------|----------|----------|
+| **CLAUDE.md** | Project-level instructions, conventions, common commands | Permanent (user-managed) | Project root, `~/.claude/CLAUDE.md`, parent directories |
+| **Auto-memory directory** | Machine-extracted facts from conversations | Cross-session | `~/.claude/projects/<project>/memory/` |
+| **Background memory extraction agent** | Durable knowledge extracted near context limits | Cross-session | Same memory directory, triggered at ~90% |
+| **Context compaction** | Compressed conversation state | Within-session | In-memory (replaces conversation history) |
+| **Raw session transcripts** | Complete uncompressed JSONL logs of every message | Permanent | `~/.claude/projects/<project>/sessions/*.jsonl` |
+
+The raw JSONL transcripts are the safety net: even after aggressive compaction, the full conversation is on disk. This enables post-hoc analysis, debugging, and—crucially—allows the memory extraction agent to mine old sessions for knowledge that wasn't captured in real time.
+
+### The Compaction Engine: Three Tiers (Barazany Source Analysis)
+
+Source analysis by Barazany reveals that Claude Code's compaction engine operates in three distinct tiers, more granular than the four-tier progressive system described above:
+
+**Tier 1 — Lightweight cleanup (before every API call):**
+```
+Before each inference call:
+  - Clear old tool results (keep only the latest 5)
+  - Strip stale assistant messages of verbose outputs
+  - Cost: negligible — no LLM call required
+  
+This runs unconditionally, not triggered by thresholds.
+```
+
+**Tier 2 — Server-side strategies (at moderate pressure):**
+```
+When context pressure rises:
+  - Thinking block clearing: remove extended thinking from older turns
+  - Tool result clearing via API: use Anthropic's message API to
+    selectively drop tool_result content blocks
+  - Cost: zero LLM tokens — purely structural
+```
+
+**Tier 3 — Full LLM summarization (at high pressure):**
+```
+When Tier 1+2 are insufficient, generate a 9-section summary:
+
+  1. Primary intent and current goal state
+  2. Key concepts and domain terminology established
+  3. Files read, created, or modified (with paths)
+  4. Tool calls made and their outcomes
+  5. Errors encountered and resolutions
+  6. Decisions made and their rationale
+  7. Current progress toward the goal
+  8. Open questions and blockers
+  9. Recommended next steps
+
+This is the expensive path — requires a full LLM call.
+```
+
+### Post-Compaction Reconstruction
+
+After Tier 3 compaction fires, Claude Code doesn't just inject the summary—it reconstructs a full working context:
+
+```
+Post-compaction context (in order):
+
+1. ── Boundary marker ──────────────────────────────────
+   "[system] Context was compacted. Summary follows."
+
+2. ── Formatted 9-section summary ──────────────────────
+   (from Tier 3 summarization above)
+
+3. ── 5 most recently accessed files ───────────────────
+   Re-read from disk, up to 50K tokens total
+   (ensures working set is fresh, not stale summaries)
+
+4. ── Re-injected skills ──────────────────────────────
+   Any active skill definitions reloaded
+
+5. ── Tool definitions re-announced ────────────────────
+   Full tool schemas, so model knows what's available
+
+6. ── Session hooks re-run ─────────────────────────────
+   Any PreToolUse / PostToolUse hooks re-executed
+
+7. ── CLAUDE.md restored ──────────────────────────────
+   Project instructions re-injected at system level
+```
+
+The 50K token budget for file restoration is a carefully tuned constant: enough to restore meaningful file context, small enough to leave room for the model to actually work.
+
+### Cache-Aware Compaction
+
+Claude Code's compaction is designed to preserve Anthropic's prompt cache. Instead of modifying existing messages (which would invalidate the cache prefix), it uses `cache_edits`—a mechanism that appends compaction metadata without altering the cached prefix:
+
+```
+Standard approach (breaks cache):
+  Turn 1: [system][user][assistant]  ← cached
+  Turn 2: [system][user][assistant][user][assistant]  ← cached up to turn 1
+  After compaction: [system][SUMMARY][user]  ← cache MISS (prefix changed)
+
+Cache-aware approach (preserves cache):
+  Turn 1: [system][user][assistant]  ← cached
+  Turn 2: [system][user][assistant][user][assistant]  ← cached up to turn 1
+  After compaction: [system][user][assistant]...[cache_edit: summary]
+                     ^^^^^^^^^^^^^^^^^^^^^^^^ prefix preserved = cache HIT
+```
+
+The forked summarization call is also cache-aware: it piggybacks on the main conversation's cached prefix, meaning the Tier 3 LLM summarization call reuses the same KV-cache entries as the primary conversation. The summarization model reads the full conversation history (cache hit) and generates only the summary (new tokens).
+
+### Programmable Hooks
+
+Claude Code exposes 17 lifecycle hook events for governance and automation, configured via JSON in the `.claude/` directory:
+
+```json
+// .claude/settings.json (hooks section)
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "write_file",
+        "command": "node .claude/hooks/lint-before-write.js"
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "bash",
+        "command": "node .claude/hooks/check-no-secrets.js"
+      }
+    ]
+  }
+}
+```
+
+| Hook category | Events | Use cases |
+|---------------|--------|-----------|
+| **PreToolUse** | Before any tool execution | Block dangerous commands, inject context, require confirmation |
+| **PostToolUse** | After tool returns | Run linters, validate outputs, trigger side effects |
+| **Session lifecycle** | Start, stop, compact, resume | Initialize state, save checkpoints, log analytics |
+| **Memory** | Read, write, extract | Gate what enters persistent memory, enforce schemas |
+
+Hooks can **block actions** (exit non-zero to prevent tool execution), **inject context** (stdout is appended to the conversation), and **run arbitrary scripts** (linters, formatters, security scanners). This makes Claude Code extensible without modifying the harness itself.
 
 ## 11.3 Cursor
 
@@ -523,6 +779,136 @@ The model's awareness that it has ample remaining room changes its behavior. It'
 | DeepWiki | Auto-generated repo documentation | Cache (regenerated) | URL-based |
 | Session search | Full-text search across past sessions | Permanent | Search across shell, file, browser, git, MCP |
 
+### Session Types
+
+Devin distinguishes between two session types, each with different context strategies:
+
+| Mode | Purpose | Context footprint | Side effects |
+|------|---------|-------------------|--------------|
+| **Ask mode** | Lightweight exploration, Q&A, codebase understanding | Minimal — no VM, no browser | None — cannot modify files, repos, or state |
+| **Agent mode** | Full autonomous execution | Full VM, browser, editor, terminal | Creates branches, opens PRs, modifies infrastructure |
+
+Ask mode is not a limited version of Agent mode—it's a fundamentally different runtime. By eliminating the execution environment entirely, Ask mode avoids loading tool definitions, sandbox state, and environment context, leaving maximum context headroom for reasoning about the codebase.
+
+### Knowledge System
+
+Devin's knowledge layer consists of **persistent tips** that are recalled across ALL sessions, not just the session that created them:
+
+```
+Knowledge entry lifecycle:
+  1. User creates a tip (or Devin auto-suggests from conversation)
+  2. Tip is stored with semantic embedding
+  3. On every new session:
+     - Session prompt is embedded
+     - Relevant tips retrieved by cosine similarity
+     - Top-k tips injected into system context
+  4. Tips accumulate over time — the team's knowledge grows
+```
+
+Auto-suggestion is the key differentiator: Devin monitors conversations for patterns that look like reusable knowledge ("always run migrations before deploying," "the billing service requires VPN access") and proposes them as persistent tips. The user approves or dismisses.
+
+### Playbooks
+
+Playbooks are reusable structured prompts distilled from successful sessions:
+
+```markdown
+# Playbook: Deploy to Staging
+
+## Outcome
+Application deployed to staging environment with all tests passing.
+
+## Steps
+1. Pull latest from main
+2. Run database migrations
+3. Build Docker image with staging config
+4. Push to ECR
+5. Update ECS task definition
+6. Run smoke tests against staging URL
+
+## Specs
+- Docker image must be < 500MB
+- Smoke tests must complete in < 60 seconds
+- Zero-downtime deployment required
+
+## Advice
+- Check for pending migrations BEFORE building the image
+- The staging VPN must be connected for smoke tests
+
+## Forbidden Actions
+- Never deploy to production from this playbook
+- Never skip smoke tests even if build succeeds
+- Never modify production database connection strings
+```
+
+Playbooks carry **usage analytics**: session count, unique users, and merged PRs attributed to playbook-guided sessions. This lets teams identify which playbooks are effective and which need revision—playbooks with high session counts but low PR merge rates indicate a process that's running but not producing results.
+
+Playbooks are versioned and can be created directly from successful sessions ("this worked—save as playbook").
+
+### Session Insights
+
+Session Insights provide on-demand analysis of completed sessions:
+
+```
+Session Insight Report:
+─────────────────────
+Session: "Migrate billing to Stripe v3"
+Duration: 2h 47m
+Tokens used: 1.2M input / 34K output
+
+Issues Found:
+  ⚠ 3 unnecessary file re-reads (same content, 45K wasted tokens)
+  ⚠ Test suite run twice with identical config
+  ✓ No context compaction triggered (efficient session)
+
+Timeline:
+  0:00-0:15  Codebase exploration (12 files read)
+  0:15-1:30  Migration implementation
+  1:30-2:00  Test failures, debugging
+  2:00-2:47  Fix + verification
+
+Efficiency: 78/100
+Recommendation: "Consider creating a playbook for Stripe migrations —
+                 this is the 3rd similar session this month."
+```
+
+### @ Mentions
+
+Devin's prompt interface supports structured references via `@` mentions:
+
+| Mention | What it injects |
+|---------|----------------|
+| `@Repos` | Repository context (file tree, README, recent commits) |
+| `@Files` | Specific file contents loaded into context |
+| `@Macros` | Knowledge tips (persistent cross-session knowledge) |
+| `@Playbooks` | Structured multi-step playbook definitions |
+| `@Secrets` | Secret references (injected securely, not shown in context) |
+| `@Sessions` | Context from previous Devin sessions |
+
+Each `@` mention is a **context injection point**: a structured way for the user to direct what enters the model's context window. This is explicit context curation, as opposed to the implicit retrieval done by RAG systems.
+
+### DeepWiki and MCP Integration
+
+**DeepWiki** auto-generates documentation for any GitHub repository: architecture overviews, module descriptions, dependency graphs. It's available as an MCP server, meaning any MCP-compatible agent can query DeepWiki for repository understanding without reading raw source files.
+
+The **Devin MCP server** exposes four management domains:
+
+| MCP Domain | Capabilities |
+|------------|-------------|
+| **Session management** | Create, query, resume, archive Devin sessions |
+| **Knowledge management** | CRUD on persistent tips, semantic search |
+| **Playbook management** | List, invoke, update playbooks |
+| **Schedule management** | Create and manage time-triggered agent runs |
+
+This means external agents—including other Devins—can manage Devin instances programmatically. A coordinator Devin can spawn worker Devins via MCP, monitor their sessions, and inject knowledge tips as they work.
+
+### Self-Hosting: "Cognition Uses Devin to Build Devin"
+
+Cognition's most compelling proof point: they use Devin to develop Devin itself. In one reported week, **659 PRs were merged** by Devin instances working on the Devin codebase. This is the strongest possible validation of a context management system—it must handle real-world software engineering tasks at scale against its own codebase.
+
+### DANA: Specialized Data Analysis Agent
+
+**DANA** (Devin ANAlysis) is a specialized Devin variant for data analysis. It connects to data warehouses via MCP, replacing the code execution sandbox with database query capabilities. DANA demonstrates that the Devin context management architecture is separable from its coding-specific tools—the thread lifecycle, knowledge system, and playbook infrastructure work equally well for analytical workflows.
+
 ## 11.5 Manus
 
 ### Four Framework Rebuilds ("Stochastic Graduate Descent")
@@ -654,41 +1040,152 @@ Migrate billing endpoints from Express to Fastify
 - [ ] /api/billing/webhooks (waiting on Stripe SDK update)
 ```
 
-## 11.6 Convergence and Divergence
+## 11.6 Anthropic's Managed Agents (April 2026)
+
+> "Decoupling the brain from the hands."
+> — Anthropic, Managed Agents Design
+
+### The Core Insight: Three Independent Interfaces
+
+Anthropic's Managed Agents architecture decomposes agent systems into three interfaces that can fail or be replaced independently:
+
+```
+┌───────────────────────────────────────────────────────────────────┐
+│                    MANAGED AGENTS ARCHITECTURE                     │
+│                                                                   │
+│  ┌─────────────┐   ┌─────────────┐   ┌─────────────────────────┐│
+│  │   BRAIN      │   │   HANDS      │   │   SESSION (Event Log)   ││
+│  │             │   │             │   │                         ││
+│  │ Claude +    │   │ Sandboxed   │   │ Ordered event stream    ││
+│  │ harness     │   │ containers  │   │ of all actions +        ││
+│  │ logic       │   │             │   │ observations            ││
+│  │             │   │ - Terminal  │   │                         ││
+│  │ Decides     │   │ - Browser   │   │ Persisted, replayable,  ││
+│  │ what to do  │   │ - Any tool  │   │ inspectable             ││
+│  │             │   │ - Pokémon   │   │                         ││
+│  │             │   │   emulator  │   │                         ││
+│  └──────┬──────┘   └──────┬──────┘   └─────────────────────────┘│
+│         │                 │                                      │
+│         └────────┬────────┘                                      │
+│                  │                                                │
+│         Each can fail or be                                      │
+│         replaced independently                                   │
+└───────────────────────────────────────────────────────────────────┘
+```
+
+This is a **meta-harness** design: unopinionated about the specific harness implementation, but opinionated about the interfaces between components. A container is a "hand"—it can be a browser, a terminal, a Pokémon emulator, or anything that accepts actions and returns observations. Brains can **pass hands to one another**, enabling multi-agent workflows where different Claude instances share execution environments.
+
+### Multi-Agent Evolution
+
+Anthropic documents their progression through multi-agent architectures:
+
+```
+Stage 1: Single Agent
+  Brain ──► Hand
+  One Claude, one sandbox.
+  Problem: context limits, no specialization.
+
+Stage 2: Two-Agent (Initializer + Coding)
+  Initializer Brain ──► setup Hand ──► pass to ──► Coding Brain ──► coding Hand
+  Separate initialization from execution.
+  Problem: no feedback loop on code quality.
+
+Stage 3: Three-Agent (Planner + Generator + Evaluator)
+  ┌──────────┐     ┌──────────┐     ┌──────────┐
+  │ Planner  │────►│Generator │────►│Evaluator │
+  │          │     │          │     │          │
+  │ Decomposes│    │ Writes   │     │ Reviews  │
+  │ tasks     │    │ code     │     │ output   │
+  └──────────┘     └──────────┘     └────┬─────┘
+                         ▲                │
+                         └────────────────┘
+                         (feedback loop)
+```
+
+The three-agent architecture introduces an **evaluation feedback loop**: the evaluator agent reviews the generator's output and can request revisions. Each agent has its own context window, meaning the system's total working memory is 3× a single window, and each agent can specialize its context for its role.
+
+### Harness Evolution: Context Resets vs. Compaction
+
+Anthropic's harness designs reveal a critical interaction between model capability and context management strategy:
+
+**The November 2025 harness (Sonnet 4.5):**
+```
+Strategy: Periodic context resets
+Reason:   Sonnet 4.5 exhibits context anxiety (same as Devin observed)
+          — quality degrades before the window is full
+
+Design:
+  Run agent for N steps → checkpoint state to files →
+  fresh context with state summary → continue
+
+  Context never exceeds ~60% of window capacity
+  Resets every ~40 tool calls
+```
+
+**The March 2026 harness (Opus 4.6):**
+```
+Strategy: Compaction alone, no resets
+Reason:   Opus 4.6 does NOT exhibit context anxiety
+          — maintains quality through full window utilization
+
+Design:
+  Run agent continuously → compact when approaching limit →
+  continue with compacted context
+
+  No arbitrary resets, no checkpointing overhead
+  Compaction only when necessary
+```
+
+This is a profound finding: **the optimal context management strategy depends on the model.** A harness designed for Sonnet 4.5's context anxiety patterns is suboptimal for Opus 4.6, and vice versa. Harness engineering is not a one-time design exercise—it must co-evolve with the model.
+
+### Implications for Harness Design
+
+The Managed Agents architecture establishes several principles:
+
+1. **Interface-first design:** Define the brain-hand-session interfaces before building anything. The specific implementations can be swapped.
+2. **Failure independence:** If the brain crashes, the hands preserve their state. If a hand fails, the brain can spin up a new one. The session log captures everything for recovery.
+3. **Model-specific strategies:** Don't assume one context management approach works for all models. Test each strategy with the specific model you deploy.
+4. **Hand portability:** Any environment that can accept actions and return observations is a valid "hand." This generalizes beyond code execution to any interactive domain.
+
+## 11.7 Convergence and Divergence
 
 ### Detailed Feature Comparison
 
-| Feature | Codex | Claude Code | Cursor | Devin | Manus |
-|---------|-------|-------------|--------|-------|-------|
-| **Compaction** | | | | | |
-| Server-side compaction | ✓ (Responses API) | ✓ (4-tier) | ✓ | — | — |
-| Local summarization | ✓ (fallback) | ✓ (compact.ts) | ✓ | ✓ | ✓ |
-| Microcompaction | — | ✓ (outputs→files) | ✓ (outputs→files) | — | ✓ (outputs→files) |
-| Context awareness | — | ✓ (model-native) | — | ✓ (anxiety) | — |
-| **Memory** | | | | | |
-| File-based memory | ✓ (AGENTS.md/docs/) | ✓ (CLAUDE.md + memory/) | ✓ (.cursor/rules/) | ✓ (notes/playbooks) | ✓ (todo.md/progress.md) |
-| Cross-session store | — | ✓ (memory tool) | — | ✓ (session search) | — |
-| Hierarchical config | ✓ (AGENTS.md→docs/) | ✓ (4-level CLAUDE.md) | ✓ (4 rule types) | ✓ (notes→playbooks) | — |
-| **Multi-Agent** | | | | | |
-| Parallel subagents | ✓ (max 6) | ✓ | ✓ | ✓ (managed Devins) | ✓ |
-| Subagent depth | 1 (hard limit) | configurable | configurable | 1 (coordinator) | 1 |
-| Isolated VMs | — | — | — | ✓ | ✓ |
-| **Dynamic Loading** | | | | | |
-| Dynamic tool loading | — | — | ✓ (46.9% savings) | — | ✓ (logit masking) |
-| Tool search | — | — | — | — | — |
-| Skill system | ✓ | — | ✓ (MDC format) | ✓ (playbooks) | — |
-| **Cache Optimization** | | | | | |
-| Stable prefix design | ✓ | ✓ | ✓ | — | ✓ (highest priority) |
-| Prompt caching API | ✓ | ✓ | ✓ | — | ✓ |
-| Append-only context | — | — | — | — | ✓ |
-| Deterministic serialization | — | — | — | — | ✓ |
-| **Unique Features** | | | | | |
-| Semantic codebase index | — | — | ✓ (Merkle tree) | — | — |
-| Index reuse (simhash) | — | — | ✓ (691x speedup) | — | — |
-| Architectural enforcement | ✓ (linters, layers) | — | — | — | — |
-| Context anxiety handling | — | — | — | ✓ (1M window) | — |
-| Logit masking | — | — | — | — | ✓ (state machine) |
-| Todo recitation | — | — | — | — | ✓ (attention anchor) |
+| Feature | Codex | Claude Code | Cursor | Devin | Manus | Managed Agents |
+|---------|-------|-------------|--------|-------|-------|----------------|
+| **Compaction** | | | | | | |
+| Server-side compaction | ✓ (Responses API) | ✓ (4-tier) | ✓ | — | — | ✓ (model-dependent) |
+| Local summarization | ✓ (fallback) | ✓ (compact.ts) | ✓ | ✓ | ✓ | ✓ (Opus 4.6 only) |
+| Microcompaction | — | ✓ (outputs→files) | ✓ (outputs→files) | — | ✓ (outputs→files) | — |
+| Context awareness | — | ✓ (model-native) | — | ✓ (anxiety) | — | ✓ (model-specific) |
+| Context resets | — | — | — | — | — | ✓ (Sonnet 4.5 harness) |
+| **Memory** | | | | | | |
+| File-based memory | ✓ (AGENTS.md/docs/) | ✓ (CLAUDE.md + memory/) | ✓ (.cursor/rules/) | ✓ (notes/playbooks) | ✓ (todo.md/progress.md) | ✓ (session event log) |
+| Cross-session store | — | ✓ (memory tool) | — | ✓ (session search) | — | ✓ (event log replay) |
+| Hierarchical config | ✓ (AGENTS.md→docs/) | ✓ (4-level CLAUDE.md) | ✓ (4 rule types) | ✓ (notes→playbooks) | — | — |
+| **Multi-Agent** | | | | | | |
+| Parallel subagents | ✓ (max 6) | ✓ | ✓ | ✓ (managed Devins) | ✓ | ✓ (brain-to-brain) |
+| Subagent depth | 1 (hard limit) | configurable | configurable | 1 (coordinator) | 1 | configurable (3-agent shown) |
+| Isolated VMs | — | — | — | ✓ | ✓ | ✓ (containers as hands) |
+| Hand passing | — | — | — | — | — | ✓ (brains share hands) |
+| **Dynamic Loading** | | | | | | |
+| Dynamic tool loading | — | — | ✓ (46.9% savings) | — | ✓ (logit masking) | — |
+| Tool search | — | — | — | — | — | — |
+| Skill system | ✓ | — | ✓ (MDC format) | ✓ (playbooks) | — | — |
+| **Cache Optimization** | | | | | | |
+| Stable prefix design | ✓ | ✓ | ✓ | — | ✓ (highest priority) | — |
+| Prompt caching API | ✓ | ✓ | ✓ | — | ✓ | ✓ |
+| Append-only context | — | — | — | — | ✓ | — |
+| Deterministic serialization | — | — | — | — | ✓ | — |
+| **Unique Features** | | | | | | |
+| Semantic codebase index | — | — | ✓ (Merkle tree) | — | — | — |
+| Index reuse (simhash) | — | — | ✓ (691x speedup) | — | — | — |
+| Architectural enforcement | ✓ (linters, layers) | — | — | — | — | — |
+| Context anxiety handling | — | — | — | ✓ (1M window) | — | ✓ (model-specific harness) |
+| Logit masking | — | — | — | — | ✓ (state machine) | — |
+| Todo recitation | — | — | — | — | ✓ (attention anchor) | — |
+| Brain/hand separation | — | — | — | — | — | ✓ (core architecture) |
+| Failure independence | — | — | — | — | — | ✓ (per-interface) |
 
 ### Where They Converge
 
@@ -697,16 +1194,18 @@ Every system, without exception:
 2. **Uses files for persistent state.** Markdown, JSON, or plain text on disk is the universal memory substrate.
 3. **Supports multi-agent delegation.** No single agent can handle unbounded tasks alone.
 4. **Uses project configuration files.** AGENTS.md, CLAUDE.md, .cursor/rules/ — different names, same purpose.
+5. **Treats containers as the execution boundary.** Whether called sandboxes (Codex), VMs (Devin), or hands (Managed Agents), every system isolates tool execution from the brain.
 
 ### Where They Diverge
 
 - **Codex** bets on architectural enforcement. Rigid layers + custom linters + structural tests. The agent has maximum autonomy within precisely defined constraints.
-- **Claude Code** bets on graduated compaction. Four tiers of progressive compression, each with different triggers and trade-offs. The most nuanced context management of any system.
+- **Claude Code** bets on graduated compaction. Four tiers of progressive compression, cache-aware summarization, and 17 programmable hooks. The most nuanced context management of any system.
 - **Cursor** bets on dynamic discovery. The semantic index + dynamic loading + 4 rule types create the most sophisticated context assembly pipeline.
-- **Devin** bets on full isolation. Each managed Devin gets its own VM, eliminating context pollution entirely through physical separation.
+- **Devin** bets on full isolation + institutional memory. Each managed Devin gets its own VM; persistent knowledge tips and playbooks accumulate organizational wisdom across all sessions.
 - **Manus** bets on KV-cache efficiency. Every design decision optimizes for cache hit rate: stable prefixes, append-only context, deterministic serialization, logit masking instead of prompt modification.
+- **Managed Agents** bets on interface decoupling. The brain-hand-session separation means any component can fail, be replaced, or be upgraded independently—including swapping the entire context management strategy when the model changes.
 
-## 11.7 Key Takeaways
+## 11.8 Key Takeaways
 
 1. **All production systems implement compaction.** The specifics vary (server-side API, client-side summarization, 4-tier progressive), but context compression is universal.
 
@@ -714,10 +1213,14 @@ Every system, without exception:
 
 3. **Enforcement beats guidance.** OpenAI's custom linters and structural tests outperform long instruction documents. Define constraints mechanically; let the agent figure out implementations.
 
-4. **Context anxiety is real and measurable.** Devin's discovery that enabling larger windows improves behavior even at low fill rates changes how you should configure context limits.
+4. **Context anxiety is real and measurable.** Devin's discovery that enabling larger windows improves behavior even at low fill rates changes how you should configure context limits. Anthropic's Managed Agents confirm this: the November 2025 harness required context resets for Sonnet 4.5, while the March 2026 harness dropped them entirely for Opus 4.6.
 
 5. **The corrections file / todo recitation pattern appears independently in multiple systems.** Manus's todo.md recitation and the Brain-of-Markdown corrections file both serve the same purpose: anchoring attention on what matters. When multiple teams converge on the same pattern independently, it's likely fundamental.
 
 6. **KV-cache efficiency is the hidden multiplier.** Manus's obsessive focus on cache hit rates (stable prefixes, append-only, deterministic serialization) yields cost reductions that compound with every inference call. This is infrastructure-level optimization that pays dividends on every token.
 
 7. **Context engineering is empirical.** Manus rebuilt four times. OpenAI's "Stochastic Graduate Descent" quote. Cursor's A/B testing. No team claims to have derived their architecture from first principles. Measure, experiment, iterate.
+
+8. **The optimal harness depends on the model.** Anthropic's Managed Agents provide the clearest evidence: a harness optimized for Sonnet 4.5 (context resets) is suboptimal for Opus 4.6 (compaction alone). Harness engineering must co-evolve with model capabilities. Design for interface stability, not implementation stability.
+
+9. **MCP is becoming the universal integration layer.** Codex, Devin, and DeepWiki all expose themselves as MCP servers. The pattern of "agent-as-MCP-tool" enables compositional multi-agent systems where any agent can orchestrate any other agent through a standardized protocol.
