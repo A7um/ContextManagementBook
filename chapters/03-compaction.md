@@ -1,185 +1,743 @@
 # Chapter 3: Compaction — Summarizing Without Forgetting
 
 > "Compaction is not 'summarize and hope.' It is summarization plus context restoration."
-> — Decode Claude
 
 ## 3.1 What Compaction Is (and Is Not)
 
-Compaction is the process of replacing a large conversation history with a smaller representation that preserves the information needed for the agent to continue working effectively. It is the primary mechanism by which agents exceed the context window limit.
+Compaction replaces a large conversation history with a smaller representation that preserves the information the agent needs to continue working. It is the primary mechanism by which agents operate beyond a single context window.
 
-Compaction is **not** truncation. Truncation discards old messages entirely—simple, predictable, but irreversibly lossy. Compaction generates a structured summary that attempts to retain the essential state: what was accomplished, what decisions were made, what errors occurred, and what should happen next.
+Compaction is **not** truncation. Truncation drops old messages — simple, predictable, irreversibly lossy. Compaction generates a structured summary that retains: what was accomplished, what decisions were made, what errors occurred, what the current state is, and what should happen next.
 
-The distinction matters because the quality of the summary determines whether the agent can continue its task or effectively starts over with partial amnesia.
+The quality of the summary determines whether the agent continues its task coherently or effectively starts over with partial amnesia. A bad summary is worse than truncation, because the agent proceeds with *false confidence* in incomplete information.
 
-## 3.2 The Industry Landscape (2026)
+## 3.2 Claude Code: Exact Thresholds from Source Code
 
-Every major provider now offers native compaction:
+Claude Code has the most documented multi-tier compaction system in production. The following constants are taken directly from the source code:
 
-| Provider | API | Trigger | Mechanism |
-|----------|-----|---------|-----------|
-| OpenAI | `context_management: [{type: "compaction", compact_threshold: 200000}]` | Token threshold | Server-side, returns encrypted `compaction` item |
-| Anthropic | `context_management.edits: [{type: "compact_20260112"}]` | Token threshold (default 150K, min 50K) | Server-side, returns `compaction` block |
-| OpenAI (standalone) | `POST /responses/compact` | On demand | Stateless endpoint, returns compacted window |
-
-Both OpenAI and Anthropic's compaction items are opaque—they contain encrypted representations of the model's understanding that are not human-readable but carry forward latent state more efficiently than a plain-text summary could.
-
-### OpenAI's Compaction Architecture
-
-OpenAI's Codex CLI uses compaction as its primary context management strategy. The system:
-
-1. Monitors token count against a configurable threshold (default ~200K for GPT-5.3-Codex)
-2. When triggered, calls the Responses API with `context_management` to generate a compaction item
-3. The compacted conversation consists of the compaction item plus preserved high-value content (user messages, recent tool calls)
-4. Subsequent inference calls use the compacted input as their starting context
-
-Early Codex versions required manual invocation (`/compact` command). Current versions trigger automatically via the Responses API's server-side compaction.
-
-### Anthropic's Compaction Architecture
-
-Anthropic's compaction (beta since January 2026, for Claude Opus 4.6 and Sonnet 4.6) follows a similar model but with distinct characteristics:
-
-- Trigger threshold is configurable (default 150K tokens, minimum 50K)
-- The same model performs both the summarization and the subsequent inference (no option for a separate summarization model)
-- Compatible with prompt caching: system prompts remain cached even across compaction events
-- Zero Data Retention (ZDR) compatible for enterprise deployments
-
-## 3.3 Claude Code: A Four-Layer Compaction System
-
-Claude Code's implementation is the most documented multi-tier compaction system in production. Based on source code analysis, it operates four progressive layers:
-
-```
-Token usage ─────────────────────────────────────────────▶
-0%         80%        85%          90%         98%
-│          │          │            │           │
-│  Normal  │  Micro-  │   Auto-    │  Session   │  BLOCK
-│operation │  compact │   compact  │  memory    │  (hard
-│          │  (clear  │   (full    │  compact   │  stop)
-│          │   old    │   summary  │  (extract  │
-│          │   tool   │   of old   │  to        │
-│          │   results│   msgs)    │  memory)   │
+```typescript
+// Core window constants
+const MODEL_CONTEXT_WINDOW_DEFAULT = 200_000;
+const COMPACT_MAX_OUTPUT_TOKENS = 20_000;
+const AUTOCOMPACT_BUFFER_TOKENS = 13_000;
+const WARNING_THRESHOLD_BUFFER_TOKENS = 20_000;
+const MANUAL_COMPACT_BUFFER_TOKENS = 3_000;
+const MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES = 3;
 ```
 
-### Layer 1: Microcompaction (Surgical, ~80% threshold)
+From these constants, every threshold can be derived:
 
-When tool outputs exceed a size threshold, Claude Code saves them to disk and replaces them with a file reference in the context. It preserves a "hot tail"—the most recent N tool results in full—while older results become pointers.
+```
+Effective window = MODEL_CONTEXT_WINDOW_DEFAULT - COMPACT_MAX_OUTPUT_TOKENS
+                 = 200,000 - 20,000
+                 = 180,000 tokens
 
-**Applies to**: Read, Bash, Grep, Glob, WebSearch, WebFetch, Edit, Write tool outputs.
+Auto-compact threshold = Effective window - AUTOCOMPACT_BUFFER_TOKENS
+                       = 180,000 - 13,000
+                       = 167,000 tokens (92.8% of effective window)
 
-This is the cheapest form of compaction: no LLM call required, no information permanently lost (the full output is on disk), and the agent can re-read any saved output by reading the file.
+Warning threshold = Effective window - AUTOCOMPACT_BUFFER_TOKENS
+                    - WARNING_THRESHOLD_BUFFER_TOKENS
+                  = 180,000 - 13,000 - 20,000
+                  = 147,000 tokens (81.7% of effective window)
 
-### Layer 2: Auto-Compaction (Full Summarization, ~85% threshold)
+Manual compact threshold = Effective window - MANUAL_COMPACT_BUFFER_TOKENS
+                         = 180,000 - 3,000
+                         = 177,000 tokens (98.3% of effective window)
+```
 
-When the conversation approaches approximately 167K tokens (200K window minus 20K output reserve minus 13K buffer), Claude Code triggers a full summarization pass.
+The Rust port (used in the Kagi/open-source ecosystem) defines an equivalent fractional constant:
 
-The model receives a structured summarization prompt—not an open-ended "summarize this conversation" but a specific contract:
+```rust
+const AUTOCOMPACT_TRIGGER_FRACTION: f64 = 0.90;
+```
 
-The summary must contain:
-- **Intent**: What is the user's original goal?
-- **Decisions**: What architectural or design decisions were made?
-- **Completed work**: What has been accomplished so far?
-- **Errors and dead ends**: What was tried and didn't work?
-- **Current state**: What is the agent in the middle of doing?
-- **Next steps**: What should the agent do next?
+And the MicroCompact subsystem has its own configurable threshold:
+
+```rust
+// MicroCompact triggers earlier than full compaction
+let trigger_threshold: f64 = 0.75; // configurable, e.g., 0.75 of effective window
+```
+
+### The Threshold Map
+
+```
+Token Usage →
+0%         73.5%     81.7%      92.8%      98.3%     100%
+│           │         │          │          │         │
+│  Normal   │ Micro-  │ Warning  │  Auto-   │ Manual  │ Hard
+│ operation │ compact │ (yellow  │ compact  │ compact │ stop
+│           │ (clear  │  badge)  │ (full    │ (block  │
+│           │  old    │          │  summary │  until  │
+│           │  tool   │          │  pass)   │  done)  │
+│           │  outs)  │          │          │         │
+└───────────┴─────────┴──────────┴──────────┴─────────┘
+                                                        
+Percentage is relative to effective window (180K)
+```
+
+**VS Code extension vs. CLI**: The VS Code extension triggers compaction much earlier — at approximately ~35% remaining capacity — versus the CLI's ~1–5% remaining. This is because VS Code users interact more slowly (typing, reading) and the extension can compact in the background without disrupting the user, while the CLI operates in tight agent loops where every token matters.
+
+### Circuit Breaker: Preventing Infinite Compaction Loops
+
+```typescript
+// If compaction fails 3 consecutive times, stop trying
+const MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES = 3;
+
+let consecutiveFailures = 0;
+
+async function attemptCompaction(): Promise<boolean> {
+    try {
+        await runCompaction();
+        consecutiveFailures = 0;  // Reset on success
+        return true;
+    } catch (error) {
+        consecutiveFailures++;
+        if (consecutiveFailures >= MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES) {
+            // Circuit breaker tripped — stop auto-compacting
+            // Fall through to hard stop on next turn
+            log.warn("Auto-compact circuit breaker: 3 consecutive failures");
+            return false;
+        }
+        return false;
+    }
+}
+```
+
+This prevents a pathological loop where the conversation is too degraded for the model to produce a good summary, the summary is rejected, and the system retries compaction endlessly. After 3 failures, the system falls through to the hard stop, which blocks further execution rather than continuing with a compromised context.
+
+## 3.3 Claude Code's Four-Tier Compaction System
+
+### Tier 1: MicroCompact — Surgical Tool Output Clearing
+
+MicroCompact fires first, at the lowest threshold. It requires no LLM call and is mechanically simple: old tool outputs beyond the "hot tail" are cleared or replaced with references.
+
+```typescript
+function microCompact(
+    messages: Message[],
+    hotTailSize: number = 5
+): Message[] {
+    const toolResultMessages = messages.filter(m => m.role === "tool");
+    const recentToolResults = toolResultMessages.slice(-hotTailSize);
+    
+    return messages.map(msg => {
+        if (msg.role === "tool" && !recentToolResults.includes(msg)) {
+            // Replace old tool output with reference
+            return {
+                ...msg,
+                content: `[Tool output cleared — was ${estimateTokens(msg.content)} tokens. ` +
+                         `Re-run the tool if this information is needed.]`
+            };
+        }
+        return msg;
+    });
+}
+```
+
+**What gets cleared**: Read, Bash, Grep, Glob, WebSearch, WebFetch, Edit, Write tool outputs older than the hot tail.
+
+**What stays**: The most recent N tool results (the hot tail), all user messages, all assistant messages (including tool *calls*), all system content.
+
+**Cost**: Zero LLM tokens. This is pure string manipulation on the message array.
+
+### Tier 2: AutoCompact — Full Summarization
+
+When MicroCompact is insufficient and the context hits the auto-compact threshold (167K tokens, 92.8% of effective window), Claude Code triggers a full summarization pass.
+
+The core logic (pseudocode based on source analysis):
+
+```typescript
+function getAutoCompactThreshold(
+    contextWindow: number = MODEL_CONTEXT_WINDOW_DEFAULT,
+    maxOutputTokens: number = COMPACT_MAX_OUTPUT_TOKENS,
+    bufferTokens: number = AUTOCOMPACT_BUFFER_TOKENS
+): number {
+    const effectiveWindow = contextWindow - maxOutputTokens;
+    return effectiveWindow - bufferTokens;
+    // 200,000 - 20,000 - 13,000 = 167,000
+}
+
+function calculateTokenWarningState(
+    currentTokens: number,
+    contextWindow: number = MODEL_CONTEXT_WINDOW_DEFAULT
+): "ok" | "warning" | "autocompact" | "blocking" {
+    const effectiveWindow = contextWindow - COMPACT_MAX_OUTPUT_TOKENS;
+    const autoCompactThreshold = effectiveWindow - AUTOCOMPACT_BUFFER_TOKENS;
+    const warningThreshold = autoCompactThreshold - WARNING_THRESHOLD_BUFFER_TOKENS;
+    const blockingThreshold = effectiveWindow - MANUAL_COMPACT_BUFFER_TOKENS;
+    
+    if (currentTokens >= blockingThreshold) return "blocking";
+    if (currentTokens >= autoCompactThreshold) return "autocompact";
+    if (currentTokens >= warningThreshold) return "warning";
+    return "ok";
+}
+```
+
+The summarization prompt is not an open-ended "summarize this conversation." It's a structured contract. The summary must contain:
+
+1. **Original intent**: What the user originally asked for
+2. **Decisions made**: Architectural choices, library selections, approach decisions
+3. **Completed work**: Files modified, tests written, features implemented
+4. **Failed approaches**: What was tried and didn't work (critical to avoid loops)
+5. **Current state**: What the agent is in the middle of doing right now
+6. **Pending work**: What still needs to be done
+7. **Key file paths**: Files the agent was actively working with
 
 After summarization, Claude Code performs **rehydration**:
-1. Re-reads the 5 most recent files the agent was working with
-2. Restores any active todo/plan state
-3. Injects a continuation message telling the agent to resume without re-asking the user
 
-This rehydration step is critical. Without it, the agent loses awareness of the current file states and must re-read them, wasting tokens and potentially losing track of in-progress edits.
-
-### Layer 3: Session Memory Compact (Experimental, ~90% threshold)
-
-Extracts key information into a persistent session memory file that survives beyond the current context window. This is distinct from auto-compaction in that it writes durable state rather than just summarizing the conversation.
-
-### Layer 4: Hard Stop (~98% threshold)
-
-When all compaction strategies are insufficient and the context is critically full, Claude Code blocks further execution to prevent silent degradation.
-
-## 3.4 When Compaction Fires: The User Experience
-
-A common misconception is that compaction is an exceptional event. In long-running agent sessions, it is routine. Anthropic found that compaction fires regularly during any substantive coding task.
-
-For developers, the key implications are:
-
-1. **Compaction is lossy.** The summary preserves the gist but loses details. Fine-grained information from early turns may not survive.
-
-2. **Compaction is asymmetric.** Tool results (re-fetchable) are safer to drop than decisions, error diagnoses, or user preferences (hard to recover).
-
-3. **Compaction creates a short-term memory boundary.** Pre-compaction information exists only in the summary's representation. If the summary didn't capture something, it's effectively forgotten.
-
-## 3.5 Designing for Compaction
-
-If your agent runs long enough, compaction *will* fire. The design question is not how to avoid it but how to ensure it works well.
-
-### Write Important State to Files
-
-A `PROGRESS.md` in the working directory, updated as the session proceeds, survives compaction completely. Files are outside the message array and are not subject to the summarizer's choices.
-
-```markdown
-# Progress
-## Completed
-- [x] Fixed auth middleware (src/middleware/auth.ts)
-- [x] Added rate limiting (src/middleware/rateLimit.ts)
-
-## In Progress
-- [ ] Migrating database schema (src/db/migrations/003.ts)
-  - Created migration file, need to add rollback
-
-## Decisions
-- Using Zod for runtime validation (not io-ts)
-- Rate limit: 100 req/min per user, 1000/min global
+```typescript
+async function rehydrateAfterCompaction(
+    summary: string,
+    recentFilesPaths: string[]
+): Message[] {
+    const rehydratedMessages: Message[] = [
+        // 1. The compacted summary
+        { role: "user", content: summary },
+        
+        // 2. Re-read the most recent files the agent was working with
+        ...await Promise.all(
+            recentFilesPaths.slice(0, 5).map(async (path) => ({
+                role: "tool",
+                content: await readFile(path),
+                tool_use_id: generateId()
+            }))
+        ),
+        
+        // 3. Restore active plan/todo state
+        ...(activePlan ? [{
+            role: "user",
+            content: `Active plan state:\n${activePlan}`
+        }] : []),
+        
+        // 4. Continuation instruction
+        {
+            role: "user",
+            content: "Continue from where you left off. " +
+                     "Do NOT re-ask the user what to do — " +
+                     "resume the task based on the summary above."
+        }
+    ];
+    
+    return rehydratedMessages;
+}
 ```
 
-This file serves as a compaction-proof anchor: the agent can re-read it after compaction and regain full awareness of project state.
+The rehydration step is critical. Without it, the agent loses awareness of current file states and must re-read them (wasting tokens) or, worse, operates on stale understanding of file contents that were modified since the last read.
 
-### CLAUDE.md as the Compaction Anchor
+### Tier 3: SessionMemory — Persistent Extraction
 
-The `CLAUDE.md` file is loaded at session start, before the conversation begins. It sits outside the message history that gets summarized. Architecture conventions, constraints, and naming standards placed in `CLAUDE.md` survive compaction by design. Rules placed in conversation messages do not have this guarantee.
+When context pressure continues to build after auto-compaction, Claude Code extracts key information into a persistent session memory file that survives beyond the current context window. This is distinct from auto-compaction: it writes durable state to the filesystem rather than just summarizing the conversation.
 
-### Compact at Task Boundaries
+The session memory file captures:
+- Key decisions and their rationale
+- File modification history
+- Error patterns observed
+- User preferences expressed during the session
 
-Don't wait for auto-compaction. Run `/compact` (or equivalent) when you finish a feature, fix a bug, or complete a logical unit of work. Compacting at a task boundary produces cleaner summaries because the conversation has a natural structure the summarizer can follow.
+### Tier 4: HardStop — Block Execution
 
-### Context Resets vs. Compaction
+When all compaction strategies are exhausted and the context is at 98.3%+ of effective window, Claude Code blocks further execution:
 
-Anthropic's research (March 2026) identified a failure mode called "context anxiety"—models prematurely wrapping up work because they sense they're approaching their context limit. With Claude Sonnet 4.5, this was severe enough that compaction alone was insufficient.
+```typescript
+if (warningState === "blocking") {
+    // Cannot proceed — context is critically full
+    // Display message to user explaining the situation
+    // Suggest: run /compact manually, start a new session,
+    // or break the task into smaller pieces
+    throw new ContextOverflowError(
+        "Context window is critically full. " +
+        "Run /compact or start a new conversation."
+    );
+}
+```
 
-Their solution: **context resets**—clearing the context window entirely and starting a fresh agent with a structured handoff artifact.
+This is a safety valve. Continuing with a critically full window would mean the model has almost no room to respond, tool call JSON might be truncated (causing parse errors), and any output would be working with the worst possible context quality (maximum degradation).
 
-| Approach | Mechanism | Preserves |
-|----------|-----------|-----------|
-| Compaction | Summarize and continue | Compressed version of full history |
-| Context reset | Clear and restart | Only what's in the handoff artifact |
+## 3.4 OpenAI Codex Compaction: Source Analysis
 
-Resets give the new agent a completely clean slate, eliminating context anxiety. The cost is that the handoff artifact must contain enough state for the next agent to pick up work cleanly—a harder authoring problem than summarization.
+OpenAI's Codex CLI implements compaction differently, with both local and remote paths. Key constants from the Rust source:
 
-With Claude Opus 4.6 (which exhibits less context anxiety), Anthropic found they could rely on compaction alone, dropping the multi-session handoff complexity entirely. This is a signal that as base model capability improves, the engineering burden of context management decreases—but does not disappear.
+```rust
+const COMPACT_USER_MESSAGE_MAX_TOKENS: usize = 20_000;
+// SUMMARIZATION_PROMPT is loaded from a template file, not hardcoded
+```
 
-## 3.6 Compaction vs. the 1M Context Window
+### Two Compaction Paths
 
-A reasonable question: if Claude Opus 4.6 and Gemini 2.5 Pro support 1M-token context windows, why compact at all?
+```rust
+fn should_use_remote_compact(provider: &Provider) -> bool {
+    provider.is_openai()
+    // Remote compaction only available for OpenAI's own API
+    // Third-party providers use local LLM summarization
+}
+```
 
-Three reasons:
+**Remote path** (`/responses/compact` endpoint): Sends the conversation to OpenAI's server-side compaction. Returns an opaque `compaction` item that carries latent state more efficiently than a plain-text summary. This is the preferred path for OpenAI API users.
 
-1. **Context rot doesn't wait.** Chroma's research showed degradation at *every* increment. A 1M window that's 80% full performs worse than a 200K window that's 40% full with better-curated content.
+**Local path** (LLM summarization): For non-OpenAI providers, Codex generates a summary using the same model. The summarization prompt is loaded from a template file and instructs the model to produce a structured summary.
 
-2. **Cost scales linearly.** Every token in the window costs KV cache memory and contributes to latency. Anthropic reported a 15% decrease in SWE-bench scores when using the full 1M window compared to managed compaction—suggesting that the quality degradation outweighs the information benefit.
+### build_compacted_history() Logic
 
-3. **Compaction is active memory management.** A 1M window is a larger budget, not a reason to stop budgeting. Compaction discards what's no longer needed and preserves what matters, keeping the context window focused regardless of its size.
+```rust
+fn build_compacted_history(
+    messages: &[Message],
+    compaction_result: &CompactionResult
+) -> Vec<Message> {
+    let mut compacted = Vec::new();
+    
+    // 1. Add the compaction summary/item
+    compacted.push(compaction_result.to_message());
+    
+    // 2. Preserve user messages from after the compaction point
+    //    (messages the user sent that weren't included in the summary)
+    for msg in messages.iter().skip(compaction_result.compacted_through) {
+        compacted.push(msg.clone());
+    }
+    
+    // 3. Truncate any user message that exceeds the max
+    for msg in &mut compacted {
+        if msg.role == Role::User {
+            msg.content = truncate_to_tokens(
+                &msg.content,
+                COMPACT_USER_MESSAGE_MAX_TOKENS  // 20,000 tokens
+            );
+        }
+    }
+    
+    compacted
+}
+```
 
-The right mental model: treat the 1M window and compaction as complementary. The large window means compaction happens less often and preserves more detail when it does fire. But it doesn't eliminate the need for it.
+### Known Bug: Mid-Turn Compaction (Issue #10346)
 
-## 3.7 Key Takeaways
+A documented bug in Codex: when compaction triggers mid-turn (while the model is executing a series of tool calls), the model can lose track of its place:
 
-1. **Compaction is summarization plus restoration.** The best systems don't just summarize—they rehydrate file state, restore plans, and inject continuation instructions.
+> "Long threads and multiple compactions can cause the model to be less accurate"
 
-2. **Multi-tier compaction outperforms single-pass.** Claude Code's four layers (micro, auto, session, hard stop) provide progressively more aggressive management as pressure increases.
+This happens because:
+1. The model is partway through a multi-step plan
+2. Compaction fires, summarizing the conversation including the partial plan
+3. The model resumes with the summary but has lost the detailed state of which step it was on
+4. It may repeat steps, skip steps, or start a different approach
 
-3. **Write critical state to files.** Files survive compaction. Conversation messages don't. If state matters, persist it outside the message array.
+The mitigation in Codex's implementation: include a warning message post-compaction alerting the model that compaction occurred, and encouraging it to re-verify its current state before proceeding.
 
-4. **Compact at task boundaries.** Proactive compaction at logical breakpoints produces better summaries than auto-compaction mid-task.
+## 3.5 Provider API Reference: Real Code
 
-5. **Context resets are sometimes better than compaction.** For models with strong context anxiety, a clean slate with a handoff artifact can outperform a summarized context.
+### OpenAI Responses API — Automatic Compaction
 
-6. **1M windows complement compaction; they don't replace it.** Even with the largest available windows, active context management improves both quality and cost.
+```python
+from openai import OpenAI
+
+client = OpenAI()
+
+response = client.responses.create(
+    model="gpt-5.3-codex",
+    input=conversation,  # List of input items (messages, tool results, etc.)
+    store=False,          # Don't persist this conversation server-side
+    context_management=[
+        {
+            "type": "compaction",
+            "compact_threshold": 200000  # Trigger compaction at this token count
+        }
+    ],
+)
+
+# When compaction fires, the response includes a `compaction` item
+# in the output. Feed this back as input for the next turn.
+# The compaction item is opaque — an encrypted representation of
+# the conversation state that the model can decode.
+for item in response.output:
+    if item.type == "compaction":
+        # Replace conversation history with the compaction item
+        # plus any new messages after the compaction point
+        conversation = [item] + new_messages_after_compaction
+```
+
+### OpenAI Standalone Compact Endpoint
+
+```python
+# For explicit, on-demand compaction (not automatic)
+compacted = client.responses.compact(
+    model="gpt-5.4",
+    input=long_input_items_array  # The full conversation to compact
+)
+
+# Returns a compacted version of the input that can be used
+# as the starting point for a new responses.create() call
+```
+
+### Anthropic Messages API — Automatic Compaction (Beta)
+
+```python
+from anthropic import Anthropic
+
+client = Anthropic()
+
+response = client.beta.messages.create(
+    model="claude-opus-4-6",
+    max_tokens=4096,
+    betas=["compact-2026-01-12"],  # Required beta flag
+    context_management={
+        "edits": [
+            {
+                "type": "compact_20260112",
+                "trigger": {
+                    "type": "input_tokens",
+                    "value": 150000  # Trigger at 150K tokens (min: 50K)
+                }
+            }
+        ]
+    },
+    messages=[
+        {"role": "user", "content": "Debug the authentication middleware..."},
+        # ... full conversation history
+    ]
+)
+
+# When compaction fires, the response includes a `compaction` content block
+# The block is opaque — carry it forward in subsequent messages
+```
+
+### Side-by-Side Comparison
+
+| Feature | OpenAI | Anthropic |
+|---------|--------|-----------|
+| API endpoint | `responses.create()` with `context_management` | `messages.create()` with `context_management.edits` |
+| Standalone endpoint | `responses.compact()` | Not available (compaction only within messages) |
+| Trigger parameter | `compact_threshold` (token count) | `trigger.value` (token count, min 50K) |
+| Default threshold | Must be specified | 150K tokens |
+| Compaction format | Opaque `compaction` item | Opaque `compaction` content block |
+| Beta flag required | No | Yes (`compact-2026-01-12`) |
+| Summarization model | Same model or dedicated compaction model | Same model only |
+| Prompt caching compat | N/A | Yes — system prompt cache preserved across compaction |
+| ZDR compatible | Yes | Yes |
+
+## 3.6 Context Resets vs. Compaction
+
+Anthropic's research (March 2026) on their harness design for long-running agents identified a failure mode called **"context anxiety"** — models prematurely wrapping up work because they sense (from the growing context and compaction artifacts) that they're approaching their context limit.
+
+### The Context Anxiety Problem
+
+```
+Behavior observed in Claude Sonnet 4.5:
+
+Turn 1-20:  Normal operation, detailed reasoning
+Turn 21-35: Reasoning becomes more terse
+Turn 36-45: Model starts saying "Let me wrap up the remaining changes"
+Turn 46-50: Model declares task complete with known issues unaddressed
+
+The model is not out of context. It is *acting as if* it will be soon,
+because the conversation is long and compaction artifacts signal
+that significant work has already occurred.
+```
+
+This is not a context window problem — it's a behavioral problem. The model's training on conversations that end after a certain length causes it to anticipate endings even when the window still has room.
+
+### Compaction vs. Context Reset
+
+| Dimension | Compaction | Context Reset |
+|-----------|-----------|---------------|
+| **Mechanism** | Summarize old turns, continue in same context | Clear window entirely, start fresh agent with handoff artifact |
+| **What survives** | Compressed version of full history | Only what's in the handoff document |
+| **Context anxiety** | Can worsen it (compaction artifacts signal "you've been working a long time") | Eliminates it (fresh context = fresh start) |
+| **Information loss** | Moderate (lossy summary) | High (only handoff artifact) |
+| **Implementation complexity** | Lower (single agent, continuous session) | Higher (orchestrator + child agents + handoff protocol) |
+| **When to use** | Model doesn't exhibit context anxiety (Opus 4.6) | Model exhibits context anxiety (Sonnet 4.5) |
+
+### The Handoff Pattern for Context Resets
+
+```python
+# Context reset with structured handoff
+async def context_reset(
+    current_agent_state: AgentState,
+    completed_work: list[str],
+    remaining_work: list[str],
+    key_decisions: list[str],
+    file_states: dict[str, str]
+) -> str:
+    """Generate a handoff artifact for a fresh agent."""
+    
+    handoff = f"""# Task Handoff
+
+## Original Request
+{current_agent_state.original_request}
+
+## Completed Work
+{chr(10).join(f'- {item}' for item in completed_work)}
+
+## Remaining Work
+{chr(10).join(f'- {item}' for item in remaining_work)}
+
+## Key Decisions
+{chr(10).join(f'- {item}' for item in key_decisions)}
+
+## Current File States
+{chr(10).join(f'### {path}{chr(10)}```{chr(10)}{content[:500]}{chr(10)}```' for path, content in file_states.items())}
+
+## Instructions
+Continue the task from where the previous agent left off.
+Focus on the remaining work items above.
+Do NOT re-do completed work.
+"""
+    return handoff
+
+# The orchestrator starts a fresh agent with the handoff
+fresh_response = client.messages.create(
+    model="claude-opus-4-6",
+    max_tokens=8192,
+    system=system_prompt,  # Same system prompt as the original agent
+    messages=[
+        {"role": "user", "content": handoff_artifact}
+    ]
+)
+```
+
+### Model-Dependent Strategy
+
+Anthropic's findings were model-specific:
+
+- **Claude Sonnet 4.5**: Exhibits strong context anxiety. Required context resets with handoff artifacts to complete long tasks without premature wrap-up.
+- **Claude Opus 4.6**: Does not exhibit significant context anxiety. Compaction alone is sufficient — the model continues working through compaction events without behavioral degradation.
+
+This is a signal that as base model capability improves, the engineering complexity of context management decreases. But it doesn't disappear. Even Opus 4.6 still benefits from compaction for quality (context rot) and cost reasons.
+
+## 3.7 The 1M Window Paradox
+
+A million tokens is roughly 750,000 words — eight full novels. Surely this eliminates the need for compaction?
+
+**Anthropic tested this directly.** In their harness design evaluation, they compared:
+- **Full 1M window**: Let Claude Opus 4.6 use the entire 1M context, no compaction
+- **Managed compaction**: Same model, same tasks, with active compaction keeping context focused at ~200K tokens
+
+**Result: 15% decrease in SWE-bench scores with the full 1M window.**
+
+The model had access to *more* information and performed *worse*. The reasons map directly to Chapter 1's findings:
+
+1. **Context rot scales with usage, not limit.** 800K tokens of accumulated history degrades performance whether the window is 800K or 1M.
+2. **Attention dilution.** With 1M tokens of content, the model's attention is spread across 5x more material. The relevant information (current task, recent edits, active errors) is a small fraction of the total.
+3. **Stale information actively misleads.** Old file contents from turn 10 are still in the window at turn 100. If the file has been modified since, the model has two conflicting versions and may use the wrong one.
+
+### The Correct Mental Model
+
+```
+┌────────────────────────────────────────────────────────┐
+│                    1M TOKEN WINDOW                      │
+│                                                          │
+│  DON'T: Fill with everything, let the model sort it out │
+│                                                          │
+│  ┌──────────────────────────────────────────────┐       │
+│  │  ~200K of focused, curated context           │       │
+│  │  (compacted history + recent turns +          │       │
+│  │   relevant files + active task state)         │       │
+│  └──────────────────────────────────────────────┘       │
+│                                                          │
+│  DO: Use the larger window as headroom                   │
+│  - Compaction fires less often                           │
+│  - More detail preserved in summaries                    │
+│  - Burst capacity for large tool outputs                 │
+│  - But still actively manage what's in the window        │
+│                                                          │
+└────────────────────────────────────────────────────────┘
+```
+
+The 1M window and compaction are complementary. The large window means compaction fires less frequently and can preserve more detail when it does fire. But filling it with everything — every old tool result, every file read, every intermediate reasoning step — produces worse outcomes than keeping 200K tokens of well-curated content.
+
+## 3.8 Designing for Compaction: Practical Patterns
+
+If your agent runs long enough, compaction *will* fire. The design question is not how to avoid it but how to make it work well.
+
+### Pattern 1: Write Important State to Files
+
+Files exist outside the message array and are not subject to the summarizer's choices. A progress file survives compaction completely:
+
+```python
+async def update_progress(agent_state: AgentState):
+    """Write current progress to a file that survives compaction."""
+    
+    progress = f"""# Task Progress
+Updated: {datetime.now().isoformat()}
+
+## Original Request
+{agent_state.original_request}
+
+## Completed
+{chr(10).join(f'- [x] {item}' for item in agent_state.completed)}
+
+## In Progress
+{chr(10).join(f'- [ ] {item}' for item in agent_state.in_progress)}
+
+## Decisions
+{chr(10).join(f'- {d}' for d in agent_state.decisions)}
+
+## Errors Encountered
+{chr(10).join(f'- {e}' for e in agent_state.errors)}
+
+## Key Files
+{chr(10).join(f'- `{f}`' for f in agent_state.active_files)}
+"""
+    
+    with open("PROGRESS.md", "w") as f:
+        f.write(progress)
+```
+
+After compaction, the agent can re-read `PROGRESS.md` and regain full awareness of project state — no information lost.
+
+### Pattern 2: Compact at Task Boundaries
+
+Don't wait for auto-compaction. Trigger compaction when you finish a logical unit of work:
+
+```python
+async def agent_loop(task: str):
+    while not is_complete():
+        result = await execute_next_step()
+        
+        if result.completed_subtask:
+            # Natural compaction point — the conversation has
+            # a clean boundary the summarizer can follow
+            await update_progress(state)
+            
+            if context_utilization() > 0.60:
+                await compact()  # Clean summary at a clean boundary
+                # Much better than auto-compacting mid-debug-session
+```
+
+Compacting at task boundaries produces cleaner summaries because the conversation has a natural structure: "We just finished X. Next we need to do Y." Auto-compaction mid-task often produces messier summaries because the conversation is in the middle of reasoning or debugging.
+
+### Pattern 3: Structured Summarization Prompts
+
+If you're implementing your own compaction (not using a provider's server-side API), the quality of the summarization prompt determines the quality of the compaction:
+
+```python
+COMPACTION_PROMPT = """You are summarizing a conversation to preserve the context 
+needed for continued work. The summary will REPLACE the conversation history, 
+so it must contain everything needed to continue.
+
+REQUIRED SECTIONS:
+1. ORIGINAL REQUEST: What the user originally asked for (verbatim if short)
+2. DECISIONS: Every architectural/design decision and its rationale
+3. COMPLETED WORK: Files modified, tests written, features implemented (with paths)
+4. FAILED APPROACHES: What was tried and didn't work (CRITICAL — prevents loops)
+5. CURRENT STATE: What you are in the middle of doing RIGHT NOW
+6. OPEN QUESTIONS: Unresolved issues or ambiguities
+7. NEXT STEPS: Exactly what should be done next, in order
+8. KEY FILE PATHS: Files you need to be aware of
+
+RULES:
+- Include file paths, function names, and error messages VERBATIM
+- Failed approaches are as important as successes — the agent must not repeat them
+- If you were debugging, include the current hypothesis and evidence
+- Be specific: "Fixed auth middleware in src/auth.ts line 42" not "Fixed auth"
+"""
+```
+
+### Pattern 4: The "Never Compact Previous Turn" Rule
+
+Relevance AI discovered this rule the hard way: **never compact the immediately previous turn unless in panic mode.** Follow-up prompts like "Edit the second paragraph" or "Keep everything except the introduction" depend on the full previous output being visible.
+
+```python
+def select_messages_for_compaction(
+    messages: list[Message],
+    panic_mode: bool = False
+) -> tuple[list[Message], list[Message]]:
+    """Split messages into compactable and preserved sets."""
+    
+    if panic_mode:
+        # Panic: compact everything except system + current turn
+        return messages[:-1], messages[-1:]
+    
+    # Normal: never compact the previous turn
+    # Find the boundary: everything before the last assistant+user pair
+    preserve_from = len(messages) - 2  # Last user + last assistant
+    
+    # Also preserve recent tool results (hot tail)
+    hot_tail_size = 3
+    tool_results = [(i, m) for i, m in enumerate(messages) if m.role == "tool"]
+    if tool_results:
+        hot_tail_start = tool_results[-hot_tail_size][0] if len(tool_results) >= hot_tail_size else tool_results[0][0]
+        preserve_from = min(preserve_from, hot_tail_start)
+    
+    to_compact = messages[:preserve_from]
+    to_preserve = messages[preserve_from:]
+    
+    return to_compact, to_preserve
+```
+
+## 3.9 Debugging Compaction Issues
+
+When an agent behaves strangely after compaction, these are the common failure modes:
+
+| Symptom | Likely Cause | Fix |
+|---------|-------------|-----|
+| Agent repeats work it already did | Summary didn't capture completed work | Include explicit "completed work" section with file paths |
+| Agent uses outdated file contents | Rehydration didn't re-read modified files | Re-read the N most recent files after compaction |
+| Agent changes approach unexpectedly | Summary lost the rationale for the chosen approach | Include "decisions + rationale" section |
+| Agent re-encounters a known dead end | Summary didn't capture failed approaches | Include "failed approaches" section (critical) |
+| Agent asks user to re-explain the task | Summary didn't capture original intent | Include verbatim original request |
+| Agent stops mid-task after compaction | Context anxiety (especially Sonnet 4.5) | Consider context resets instead of compaction |
+
+### Instrumentation for Debugging
+
+```python
+import logging
+
+logger = logging.getLogger("compaction")
+
+async def compact_with_diagnostics(
+    messages: list[Message],
+    summarizer: Callable
+) -> CompactionResult:
+    pre_tokens = count_tokens(messages)
+    pre_turns = len([m for m in messages if m.role == "assistant"])
+    
+    summary = await summarizer(messages)
+    
+    post_tokens = count_tokens(summary)
+    compression_ratio = post_tokens / pre_tokens
+    
+    logger.info(
+        f"Compaction: {pre_tokens:,} → {post_tokens:,} tokens "
+        f"({compression_ratio:.1%} of original), "
+        f"{pre_turns} turns summarized"
+    )
+    
+    # Alert if compression ratio is suspiciously high (bad summary)
+    if compression_ratio > 0.5:
+        logger.warning(
+            f"Compaction ratio {compression_ratio:.1%} is high — "
+            f"summary may be too verbose or include raw content"
+        )
+    
+    # Alert if compression ratio is suspiciously low (lost information)
+    if compression_ratio < 0.05:
+        logger.warning(
+            f"Compaction ratio {compression_ratio:.1%} is very low — "
+            f"summary may have lost critical information"
+        )
+    
+    return CompactionResult(
+        summary=summary,
+        pre_tokens=pre_tokens,
+        post_tokens=post_tokens,
+        turns_compacted=pre_turns
+    )
+```
+
+## 3.10 Key Takeaways
+
+1. **Know your exact thresholds.** Claude Code: auto-compact at 167K tokens (92.8% of effective window). Warning at 147K (81.7%). Hard stop at 177K (98.3%). Codex: configurable threshold, default ~200K. Build monitoring around these numbers.
+
+2. **Multi-tier compaction outperforms single-pass.** Claude Code's four layers (MicroCompact → AutoCompact → SessionMemory → HardStop) provide progressively more aggressive management. MicroCompact handles 80% of cases with zero LLM cost.
+
+3. **Compaction is summarization plus rehydration.** The summary alone is insufficient. Re-reading current files, restoring plan state, and injecting a continuation instruction are what make compaction work in practice.
+
+4. **Circuit breakers prevent infinite loops.** 3 consecutive compaction failures → stop trying. This prevents pathological retries on conversations too degraded to summarize.
+
+5. **Context resets beat compaction for anxiety-prone models.** Claude Sonnet 4.5 needs full resets with handoff artifacts. Opus 4.6 works fine with compaction alone. Test your specific model.
+
+6. **The 1M window paradox is real.** Anthropic measured 15% SWE-bench decrease with full 1M vs. managed compaction. More tokens ≠ better results. The large window is headroom, not a reason to stop managing.
+
+7. **Write critical state to files.** Files survive compaction. Messages don't. `PROGRESS.md` is compaction-proof memory.
+
+8. **Never compact the previous turn.** Follow-up prompts depend on it. Only break this rule in panic mode (context critically full).
+
+9. **Compact at task boundaries, not mid-task.** A clean boundary ("just finished feature X, moving to feature Y") produces a better summary than a mid-debug-session compaction.

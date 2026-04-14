@@ -2,196 +2,636 @@
 
 > "Every Claude Code session has a single budget: the context window. Two hundred thousand tokens, give or take, that have to hold the system prompt, the tool definitions, the conversation history, the user's input, the model's output, and (if extended thinking is on) the chain of thought. There is exactly one pile, and everything gets withdrawn from it."
 
-## 2.1 The Token Budget Framework
+## 2.1 The Token Budget: Dissecting a Real Session
 
-Every LLM inference call has a fixed token capacity shared across competing components. Understanding this budget—and who controls each line item—is prerequisite to managing it.
-
-A typical long-running coding agent session breaks down as follows:
+Every LLM inference call has a fixed token capacity shared across competing components. To manage the budget, you first need to see where the money goes. Here is the exact token breakdown from a typical Claude Code session at approximately turn 40, measured by inspecting the Messages API request payload:
 
 ```
-SYSTEM PROMPT               ~3,000 tokens    (1.5%)
-TOOL DEFINITIONS            ~25,000 tokens   (12.5%)   ← built-ins + MCP
-PROJECT MEMORY (CLAUDE.md)  ~2,000 tokens    (1%)
-CONVERSATION HISTORY        ~80,000 tokens   (40%)     ← grows over time
-TOOL OUTPUTS (file reads)   ~50,000 tokens   (25%)
-MODEL OUTPUT (this turn)    ~5,000 tokens    (2.5%)
-HEADROOM / OUTPUT RESERVE   ~35,000 tokens   (17.5%)
-────────────────────────────────────────────────
-TOTAL                       200,000 tokens
+┌─────────────────────────────────────────────────────────────────┐
+│                    200,000 TOKEN CONTEXT WINDOW                  │
+│                                                                   │
+│  ┌──────────┐  System Prompt              ~3,000 tokens  (1.5%) │
+│  ├──────────┤                                                    │
+│  │          │  Tool Definitions           ~25,000 tokens (12.5%)│
+│  │██████████│  (built-in + MCP servers)                          │
+│  ├──────────┤                                                    │
+│  │░░        │  Project Memory (CLAUDE.md) ~2,000 tokens  (1.0%) │
+│  ├──────────┤                                                    │
+│  │          │                                                    │
+│  │          │                                                    │
+│  │██████████│  Conversation History       ~80,000 tokens (40.0%)│
+│  │██████████│  (all user + assistant turns)                      │
+│  │██████████│                                                    │
+│  │          │                                                    │
+│  ├──────────┤                                                    │
+│  │          │                                                    │
+│  │██████████│  Tool Outputs               ~50,000 tokens (25.0%)│
+│  │██████████│  (file reads, grep, bash)                          │
+│  │          │                                                    │
+│  ├──────────┤                                                    │
+│  │░░        │  Model Output (this turn)   ~5,000 tokens  (2.5%) │
+│  ├──────────┤                                                    │
+│  │          │                                                    │
+│  │          │  Output Reserve / Headroom  ~35,000 tokens (17.5%)│
+│  │          │                                                    │
+│  └──────────┘                                                    │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
-The critical observation: three categories dominate—tool definitions (loaded on every call even if unused), conversation history (grows monotonically), and tool outputs (large, often ephemeral). The system prompt and project memory, despite being the most carefully engineered components, consume under 3%.
+Three categories dominate: tool definitions (12.5%, loaded on *every* call even if no tool is invoked), conversation history (40%, grows monotonically), and tool outputs (25%, spiky and ephemeral). The carefully engineered system prompt and project memory together consume under 3%.
 
-### Who Controls What
+### Who Controls What — and What You Can Do About It
 
-| Category | Controller | Behavior |
-|----------|-----------|----------|
-| System prompt | Agent designer | Static, loaded once |
-| Tool definitions | Framework + MCP servers | Semi-static, changes with capability |
-| Project memory | Repository config files | Static per session |
-| Conversation history | Accumulation of all turns | Grows without bound |
-| Tool outputs | Environment responses | Spiky, potentially enormous |
-| Model output | The LLM | Variable per turn |
+| Category | Who Controls It | Growth Pattern | Your Leverage |
+|----------|----------------|----------------|---------------|
+| System prompt | You (agent designer) | Static | Write it well, keep it tight |
+| Tool definitions | Framework + MCP servers | Semi-static, changes with connected servers | Dynamic loading, deferred tools |
+| Project memory | Repository config files | Static per session | Keep under 500 lines, use as map |
+| Conversation history | Accumulation of turns | Monotonically growing | Compaction, summarization, resets |
+| Tool outputs | Environment responses | Spiky (0–50K per output) | Microcompaction, clearing, truncation |
+| Model output | The LLM | Variable per turn | `max_tokens` parameter |
+| Output reserve | You (system design) | Fixed allocation | Must be maintained — model needs room to think |
 
-The designer has direct control over only the system prompt and project memory. Everything else is either determined by the framework, generated by the model, or returned by the environment. Effective context management means designing systems that govern these other components indirectly—through compaction policies, tool definitions, retrieval strategies, and architectural choices.
+You directly control only the system prompt, project memory, and the output reserve allocation. Everything else must be governed indirectly through compaction policies, tool management, retrieval strategies, and architectural choices.
 
-## 2.2 System Prompts: The Goldilocks Zone
+### The Token Budget as Code
 
-Anthropic's guidance identifies a "Goldilocks zone" for system prompt altitude—the level of specificity in instructions:
+Here is a concrete framework for managing the token budget programmatically:
 
-**Too high-level (underspecified):**
-```
-You are a helpful coding assistant. Write good code.
-```
-The agent doesn't know your stack, your conventions, or your constraints. It will hallucinate patterns.
+```python
+from dataclasses import dataclass
 
-**Too low-level (overspecified):**
-```
-When modifying a Python file, always use 4-space indentation. Never use tabs.
-Use snake_case for variables. Use PascalCase for classes. Always add type hints.
-When writing tests, use pytest, not unittest. Always mock external calls...
-[500 more lines]
-```
-The model's attention is consumed by rules it already knows or that don't apply to the current task. This is the "1,000-page instruction manual" antipattern.
+@dataclass
+class TokenBudget:
+    context_window: int        # Total model context (e.g., 200_000)
+    output_reserve: int        # Reserved for model response (e.g., 20_000)
+    compaction_buffer: int     # Buffer for compaction system (e.g., 13_000)
+    system_prompt_tokens: int  # Measured, not estimated
+    tool_definition_tokens: int # Measured per registered tool set
 
-**The Goldilocks zone:**
-```
-You are a senior engineer working on a Python FastAPI backend.
-Follow the patterns in docs/architecture.md for service structure.
-Run tests with `pytest -x` before committing.
-```
+    @property
+    def effective_window(self) -> int:
+        return self.context_window - self.output_reserve
 
-Clear identity, specific enough to act, with pointers to deeper documentation rather than inlining it all.
+    @property
+    def available_for_conversation(self) -> int:
+        return (self.effective_window 
+                - self.compaction_buffer
+                - self.system_prompt_tokens 
+                - self.tool_definition_tokens)
 
-### Organizing System Prompt Content
+    def remaining(self, current_history_tokens: int, 
+                  current_tool_output_tokens: int) -> int:
+        used = (self.system_prompt_tokens 
+                + self.tool_definition_tokens
+                + current_history_tokens 
+                + current_tool_output_tokens)
+        return self.effective_window - used
 
-Anthropic recommends organizing prompts into distinct sections with clear headers:
+    def utilization(self, current_history_tokens: int,
+                    current_tool_output_tokens: int) -> float:
+        used = (self.system_prompt_tokens 
+                + self.tool_definition_tokens
+                + current_history_tokens 
+                + current_tool_output_tokens)
+        return used / self.effective_window
 
-```
-<role>...</role>
-<tools>...</tools>
-<tool_guidance>...</tool_guidance>
-<output_format>...</output_format>
-<constraints>...</constraints>
-```
 
-This structure isn't just for human readability—it helps the model parse and weight different instruction types. Models attend more reliably to well-structured, clearly delineated sections than to unstructured prose.
+# Claude Code's actual budget
+claude_code_budget = TokenBudget(
+    context_window=200_000,
+    output_reserve=20_000,      # COMPACT_MAX_OUTPUT_TOKENS
+    compaction_buffer=13_000,   # AUTOCOMPACT_BUFFER_TOKENS
+    system_prompt_tokens=3_000,
+    tool_definition_tokens=25_000
+)
 
-## 2.3 Tool Definitions: The Hidden Token Tax
-
-Tool definitions are the largest hidden cost in agent context. Each tool definition carries:
-
-- Function name and description: ~50–100 tokens
-- Parameter schema (JSON Schema): ~200–800 tokens
-- Parameter descriptions: ~100–300 tokens
-- Per tool total: **550–1,400 tokens**
-
-For an agent with 40 registered tools (common when connecting multiple MCP servers), this translates to **22,000–56,000 tokens per inference call**—consumed whether or not a single tool is invoked.
-
-The cost compounds across the agent loop. A 50-call session with a 40,000-token tool block sends **2,000,000 tokens** just for tool definitions. At GPT-4o pricing ($2.50/M input tokens), that's $5.00 per session on tool schemas alone—before any actual work.
-
-### The Tool Selection Accuracy Problem
-
-Research shows that tool selection accuracy degrades as the number of available tools increases:
-
-| Tool Count | Selection Accuracy |
-|------------|-------------------|
-| 5 tools | ~92% |
-| 15 tools | ~74% |
-| 50+ tools | ~49% |
-
-This is not just a cost problem. It's a quality problem. The model's attention is diluted across dozens of tool definitions, making it less likely to choose the right tool for any given step.
-
-### Solutions: Dynamic Tool Loading
-
-The industry has converged on dynamic tool selection as the primary mitigation:
-
-1. **Cursor's approach**: Sync tool descriptions to files. The agent receives only tool names in the system prompt, then reads full definitions on demand. This reduced total agent tokens by 46.9% in A/B testing while maintaining or improving quality.
-
-2. **Manus's approach**: Use a context-aware state machine to mask tool choices via logit masking. The agent sees only tools valid for its current state, reducing the action space without modifying tool definitions.
-
-3. **Lightweight classifiers**: A small model or embedding-based filter selects the 3–5 most relevant tools per query, cutting tool token overhead by ~85% while improving accuracy from 49% to 74%.
-
-## 2.4 Conversation History: The Growing Burden
-
-Conversation history is the component that makes context management an engineering problem rather than a configuration problem. It grows with every turn, and every past tool call, tool result, assistant response, and user message accumulates.
-
-A 20-turn conversation with heavy tool use can easily consume 80,000–120,000 tokens of history. This creates three compound problems:
-
-1. **Token budget pressure**: History crowds out space for new tool outputs and model reasoning.
-
-2. **Attention dilution**: Early turns that are no longer relevant still consume attention. A file read from turn 3 is still in the window at turn 40, even though the file has since been modified.
-
-3. **Context rot acceleration**: The accumulation of stale information—old file contents, superseded decisions, abandoned approaches—is the primary driver of context rot in long-running agents.
-
-### The Sliding Window Pattern
-
-The most basic mitigation is a sliding window that keeps only the N most recent turns. This is simple, predictable, and lossy—early context is dropped entirely.
-
-### The Summarize-and-Slide Pattern
-
-The dominant production approach (as of 2026) combines summarization with sliding:
-
-```
-[System prompt]
-[Tool definitions]
-[Summary of turns 1–30]    ← Compressed by LLM
-[Full turns 31–40]          ← Recent history preserved verbatim
-[Current user input]
+# Available for actual conversation + tool outputs:
+# 200K - 20K - 13K - 3K - 25K = 139,000 tokens
+# That's 69.5% of the nominal window — nearly a third is overhead
+print(f"Available for work: {claude_code_budget.available_for_conversation:,}")
+# Output: Available for work: 139,000
 ```
 
-Manus adds two practical refinements:
-- Keep the most recent tool calls in raw format so the model maintains its action-selection patterns
-- Inject controlled diversity to prevent the model from pattern-matching on a too-uniform context
+The critical insight: **31% of the nominal 200K window is consumed by fixed overhead before the user types a single character.** For a 128K window model, the same overhead (system prompt + tools + reserves) leaves even less room.
 
-## 2.5 Tool Outputs: Spiky and Ephemeral
+## 2.2 Tool Definitions: The Hidden Token Tax
 
-A single `grep` result, file read, or web page fetch can return 10,000–50,000 tokens. These outputs are critical at the moment they're returned but rapidly become stale. A file read from 20 turns ago is almost certainly outdated.
+Tool definitions are the largest hidden cost in agent context. Every tool registered with the API is serialized into the prompt as a JSON Schema definition. The model needs this schema to know what tools exist, what parameters they accept, and how to format tool calls.
 
-The key principle: **tool outputs are the most compressible component of agent context**. The information they contain is re-fetchable from the environment. The agent can always re-read a file, re-run a search, or re-fetch a URL. The context window should hold summaries or references, not raw content.
+### Per-Tool Cost Breakdown
 
-Claude Code implements this as "microcompaction": when a tool output exceeds a threshold, it's saved to disk and replaced with a short reference in the context. The most recent outputs are kept in full ("the hot tail"), while older ones are replaced with paths.
+Each tool definition costs between 550 and 1,400 tokens depending on complexity:
 
-## 2.6 Project Memory: The Configuration Layer
+| Component | Token Range | Example |
+|-----------|-------------|---------|
+| Function name + description | 50–100 tokens | `"get_file_contents": "Read the contents of a file at the given path"` |
+| Parameter schema (JSON Schema) | 200–800 tokens | Object with 3-5 typed, constrained parameters |
+| Parameter descriptions | 100–300 tokens | Descriptions for each parameter explaining expected values |
+| Enum values, defaults, examples | 100–200 tokens | Lists of valid values, default settings |
+| **Total per tool** | **550–1,400 tokens** | |
 
-Modern agent systems have converged on file-based project configuration as a way to inject persistent context:
+### The MCP Server Problem: A Real Measurement
 
-| System | Config File | Scope |
-|--------|-------------|-------|
-| Claude Code | `CLAUDE.md` | Per-project instructions, survives compaction |
-| Cursor | `.cursor/rules/*.mdc` | Per-project, with glob pattern and intelligent routing |
-| Codex | `AGENTS.md` + `docs/` | Map file + structured documentation directory |
-| GitHub Copilot | `.github/copilot-instructions.md` | Per-repository instructions |
-| Cross-tool | `AGENTS.md` | Emerging standard recognized by multiple tools |
+A Chinese-language analysis of real MCP (Model Context Protocol) server deployments measured the actual token cost of common tool sets. The findings are sobering:
 
-OpenAI's harness engineering team learned a critical lesson: **treat AGENTS.md as the table of contents, not the encyclopedia.**
+| MCP Server | Tools Registered | Token Cost |
+|------------|-----------------|------------|
+| Jira MCP Server | 23 tools | ~17,000 tokens |
+| GitHub MCP Server | 30+ tools | ~20,000 tokens |
+| Filesystem MCP Server | 11 tools | ~6,000 tokens |
+| Database MCP Server | 15 tools | ~10,000 tokens |
 
-> "We tried the 'one big AGENTS.md' approach. It failed in predictable ways: context is a scarce resource. A giant instruction file crowds out the task, the code, and the relevant docs—so the model tends to ignore parts of it."
+A developer connecting Jira + GitHub + Filesystem MCP servers has consumed ~43,000 tokens of tool definitions alone. On a 128K-token model, **that's 33.6% of the context window consumed before the user sends their first message.** The analysis found that connecting common enterprise MCP server combinations could push tool definitions to 45% of a 128K window.
 
-Their solution: a short AGENTS.md (~100 lines) as a map, with pointers to deeper documentation in a structured `docs/` directory. The agent reads the map at session start, then loads specific documentation on demand.
+### 40 Tools: The Math
 
-Community consensus aligns: keep project memory files under 300–500 lines. Decompose large rule sets into composable pieces.
+For an agent with 40 registered tools (common when connecting 3-4 MCP servers):
 
-## 2.7 The Output Reserve: Why Empty Space Matters
+```
+Minimum: 40 × 550  = 22,000 tokens per inference call
+Maximum: 40 × 1,400 = 56,000 tokens per inference call
+Typical: 40 × 850  = 34,000 tokens per inference call
+```
 
-A frequently overlooked budget item is the output reserve—tokens set aside for the model's response. If you fill 195K of a 200K window with input, the model has 5K tokens for its response, which may need to include reasoning, a tool call schema, and the tool's arguments.
+Over a 50-call agent session with 34K tokens of tool definitions per call:
 
-Claude Code reserves approximately 33,000 tokens as headroom:
-- ~20,000 for the model's output
-- ~13,000 as buffer for the compaction system
+```
+Total tool definition tokens sent: 50 × 34,000 = 1,700,000 tokens
+At $3.00/M input tokens (Claude Sonnet):     $5.10 per session
+At $15.00/M input tokens (Claude Opus):      $25.50 per session
+```
 
-When the available headroom drops below this reserve, auto-compaction triggers. The reserve is not wasted space; it is the model's room to think.
+This is the cost of *describing* tools, not *using* them. The model processes these definitions on every inference call whether it uses zero tools or five.
+
+### Tool Selection Accuracy Degrades with Count
+
+The cost problem compounds with a quality problem. Research on tool selection accuracy shows a clear degradation curve:
+
+| Tool Count | Selection Accuracy | Error Pattern |
+|------------|-------------------|---------------|
+| 5 tools | ~92% | Rare: occasional parameter errors |
+| 15 tools | ~74% | Moderate: picks wrong tool from similar set |
+| 50+ tools | ~49% | Severe: coin-flip accuracy, hallucinated tools |
+
+At 50 tools, the model is essentially guessing. This is not just about context length — it's about attention dilution. The model must attend to 50 different schema definitions to select the right one, and its attention is spread too thin.
+
+### Solution 1: Anthropic's Tool Search with Deferred Loading
+
+Anthropic introduced `tool_search_tool_regex` with `defer_loading` to address this directly. Tools marked as `defer_loading: True` are registered in the system but their full schemas are only loaded into context when the model indicates it wants to use them.
+
+```python
+from anthropic import Anthropic
+
+client = Anthropic()
+
+response = client.messages.create(
+    model="claude-opus-4-6",
+    max_tokens=2048,
+    tools=[
+        # The search tool itself — always loaded, allows Claude to find tools
+        {
+            "type": "tool_search_tool_regex_20251119",
+            "name": "tool_search_tool_regex"
+        },
+        # Deferred tools — schema NOT loaded until Claude requests them
+        {
+            "name": "get_weather",
+            "description": "Get current weather for a location",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "location": {"type": "string", "description": "City name"},
+                    "units": {"type": "string", "enum": ["celsius", "fahrenheit"]}
+                },
+                "required": ["location"]
+            },
+            "defer_loading": True
+        },
+        {
+            "name": "search_database",
+            "description": "Search the product database with filters",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "category": {"type": "string"},
+                    "max_results": {"type": "integer", "default": 10}
+                },
+                "required": ["query"]
+            },
+            "defer_loading": True
+        },
+        # ... 40 more deferred tools
+    ],
+    messages=[{"role": "user", "content": "What's the weather in Tokyo?"}]
+)
+```
+
+When `defer_loading` is `True`, only the tool's *name* and *description* are included in the prompt (roughly 50-100 tokens instead of 550-1,400). The full schema is loaded only when Claude decides to use that tool. For 40 tools, this reduces the tool definition cost from ~34K tokens to ~4K tokens — an 88% reduction.
+
+### Solution 2: Programmatic Tool Filtering
+
+If you know which tools are relevant based on the user's current context, filter them before the API call:
+
+```python
+def select_relevant_tools(
+    user_message: str,
+    all_tools: list[dict],
+    max_tools: int = 10
+) -> list[dict]:
+    """Select the most relevant tools based on the current message."""
+    
+    # Option A: Keyword/category matching (fast, zero cost)
+    category = classify_intent(user_message)  # "code_edit", "search", "deploy"
+    tools_by_category = {
+        "code_edit": ["read_file", "write_file", "apply_diff", "run_tests"],
+        "search": ["grep", "glob", "web_search", "search_codebase"],
+        "deploy": ["run_command", "docker_build", "check_ci", "create_pr"],
+    }
+    relevant_names = tools_by_category.get(category, [])
+    
+    # Option B: Embedding-based similarity (higher quality, small cost)
+    # query_embedding = embed(user_message)
+    # tool_embeddings = {t["name"]: embed(t["description"]) for t in all_tools}
+    # relevant_names = top_k_similar(query_embedding, tool_embeddings, k=max_tools)
+    
+    return [t for t in all_tools if t["name"] in relevant_names]
+
+# Usage in the agent loop
+tools_for_this_turn = select_relevant_tools(
+    user_message=current_input,
+    all_tools=all_registered_tools,
+    max_tools=10
+)
+response = client.messages.create(
+    model="claude-sonnet-4-6",
+    tools=tools_for_this_turn,  # 10 tools instead of 40
+    messages=conversation
+)
+```
+
+### Solution 3: Prompt Caching (Cost, Not Token Count)
+
+Prompt caching doesn't reduce context window usage (the tools still consume tokens in the window), but it dramatically reduces the *cost* of repeated tool definitions:
+
+```python
+response = client.messages.create(
+    model="claude-sonnet-4-6",
+    max_tokens=4096,
+    system=[
+        {
+            "type": "text",
+            "text": system_prompt,
+            "cache_control": {"type": "ephemeral"}  # Cache the system prompt
+        }
+    ],
+    tools=tools_with_cache_control,  # Tools cached between calls
+    messages=conversation
+)
+```
+
+With prompt caching, the 34K tokens of tool definitions are sent fully on the first call, then served from cache on subsequent calls at 90% lower cost. Over a 50-call session, the tool definition cost drops from $5.10 to ~$0.85 (Sonnet pricing).
+
+### Solution 4: Cursor's Approach — Tools as File References
+
+Cursor implemented a radical approach: strip tool definitions from the context entirely and replace them with file-based descriptions. The agent receives only tool *names* in the system prompt. When the agent needs a tool, it reads the full definition from a file.
+
+In A/B testing, this approach reduced total agent tokens by **46.9%** while maintaining or improving task completion quality. The insight: the model doesn't need 40 tool schemas to decide which tool to use. A short name and one-line description is sufficient for selection. The full schema is only needed at the moment of invocation.
+
+## 2.3 Conversation History: The Unbounded Growth Problem
+
+History is the component that turns context management from a configuration problem into an engineering problem. It grows with every turn, and every turn includes:
+
+- The user's message (or continuation instruction)
+- The model's response (including reasoning and tool calls)
+- Tool results (file contents, command output, search results)
+- The model's follow-up after processing tool results
+
+A single turn in a heavy tool-use session can add 5,000–15,000 tokens. Twenty turns adds 100K–300K tokens. By turn 30, most 200K models are deep into compaction territory.
+
+### Growth Rate by Agent Type
+
+| Agent Type | Tokens/Turn (avg) | Turns to 70% (200K window) |
+|------------|-------------------|----------------------------|
+| Chat (no tools) | 500–1,500 | ~90–280 turns |
+| Light tool use (search, read) | 3,000–8,000 | ~12–30 turns |
+| Heavy tool use (code agent) | 8,000–15,000 | ~6–12 turns |
+| Full agent (edit + test + debug) | 10,000–20,000 | ~5–10 turns |
+
+A full coding agent hits 70% utilization in as few as 5 turns. This is why compaction is not an edge case — it's routine. Claude Code's auto-compaction triggers multiple times in any substantive coding session.
+
+### The Sliding Window vs. Summarize-and-Slide
+
+**Sliding window** (keep last N turns, drop the rest):
+```
+[System] [Tools] [Turn 31] [Turn 32] ... [Turn 40] [Current]
+```
+Simple and predictable, but loses all information from dropped turns. If the model made a critical decision in turn 5, it's gone.
+
+**Summarize-and-slide** (dominant production pattern):
+```
+[System] [Tools] [Summary of turns 1–30] [Turn 31] ... [Turn 40] [Current]
+```
+Preserves the gist of old turns while keeping recent turns verbatim. The summary is lossy but intentional — it captures decisions, completed work, errors, and plans while discarding raw file contents and intermediate reasoning.
+
+Manus adds two refinements validated in production:
+1. **Keep recent tool calls in raw format** so the model maintains action-selection patterns. If the last 3 turns used `read_file → edit_file → run_tests`, keeping those tool calls verbatim helps the model continue the pattern.
+2. **Inject controlled diversity** in the summary to prevent the model from over-fitting on a uniform context pattern.
+
+## 2.4 Tool Outputs: Spiky, Ephemeral, Re-fetchable
+
+Tool outputs are the most compressible component of agent context because they are *re-fetchable*. The agent can always re-read a file, re-run a search, or re-execute a command. The context window should hold summaries or references, not raw content.
+
+### The Spike Problem
+
+A single tool call can return anywhere from 10 tokens to 50,000 tokens:
+
+| Tool | Typical Output Size | Worst Case |
+|------|-------------------|------------|
+| `read_file` (small file) | 500–2,000 tokens | 50,000+ tokens (large file) |
+| `grep/ripgrep` | 500–5,000 tokens | 20,000+ tokens (broad match) |
+| `bash` (test output) | 200–2,000 tokens | 30,000+ tokens (verbose test suite) |
+| `web_fetch` | 2,000–10,000 tokens | 50,000+ tokens (full page) |
+| `list_directory` | 100–500 tokens | 5,000+ tokens (large directory) |
+
+A single unfortunate `grep` with a common pattern can spike 20K tokens into the window in one turn. Without protection, one oversized tool result can push the window from comfortable to critical.
+
+### Mitigation: Output Truncation
+
+Most production agents truncate tool outputs to a maximum size:
+
+```python
+MAX_TOOL_OUTPUT_TOKENS = 30_000  # Hard ceiling
+
+def truncate_tool_output(output: str, max_tokens: int = MAX_TOOL_OUTPUT_TOKENS) -> str:
+    tokens = tokenize(output)
+    if len(tokens) <= max_tokens:
+        return output
+    
+    # Keep beginning and end (high-attention zones), truncate middle
+    keep_start = max_tokens // 3
+    keep_end = max_tokens // 3
+    
+    start_text = detokenize(tokens[:keep_start])
+    end_text = detokenize(tokens[-keep_end:])
+    
+    omitted = len(tokens) - keep_start - keep_end
+    return (f"{start_text}\n\n"
+            f"[... {omitted} tokens omitted — "
+            f"use read_file with offset to see full content ...]\n\n"
+            f"{end_text}")
+```
+
+### Mitigation: Microcompaction (Claude Code's Approach)
+
+Claude Code's microcompaction saves old tool outputs to disk and replaces them with file references. The "hot tail" (most recent N tool results) stays verbatim; older results become pointers:
+
+```
+Turn 15 tool result: "See /tmp/tool_outputs/turn_15_read.txt for full output.
+                      Summary: src/auth.py — 342 lines, defines AuthMiddleware class
+                      with JWT validation."
+
+Turn 38 tool result: [Full 3,000-token file content preserved verbatim]
+Turn 39 tool result: [Full 1,500-token grep output preserved verbatim]
+Turn 40 tool result: [Full 5,000-token test output preserved verbatim]
+```
+
+This approach requires no LLM call (it's purely mechanical), loses no information (the full output is on disk), and the agent can re-read any saved output if needed.
+
+## 2.5 Project Memory Files: The Configuration Layer
+
+Modern agent systems converge on file-based configuration for injecting persistent context that survives compaction. Here is a comparison of the major systems:
+
+| System | Config File | Location | Scope | Loaded When | Survives Compaction |
+|--------|------------|----------|-------|-------------|-------------------|
+| Claude Code | `CLAUDE.md` | Repo root (+ subdirs) | Per-project | Session start, re-read after compaction | Yes (outside message array) |
+| Cursor | `.cursor/rules/*.mdc` | `.cursor/rules/` directory | Per-project, glob-pattern scoped | On demand, matched by file pattern | Yes (re-injected per turn) |
+| OpenAI Codex | `AGENTS.md` + `docs/` | Repo root + `docs/` directory | Per-project | Session start, docs on demand | Yes (`AGENTS.md` as anchor) |
+| GitHub Copilot | `.github/copilot-instructions.md` | `.github/` directory | Per-repository | Session start | Varies by client |
+| Cross-tool | `AGENTS.md` | Repo root | Multi-tool standard | Session start | Depends on agent implementation |
+
+### The "Table of Contents, Not Encyclopedia" Lesson
+
+OpenAI's harness engineering team learned this the hard way:
+
+> "We tried the 'one big AGENTS.md' approach. It failed in predictable ways: context is a scarce resource. A giant instruction file crowds out the task, the code, and the relevant docs — so the model tends to ignore parts of it."
+
+Their solution: a short `AGENTS.md` (~100 lines) as a map, with deeper documentation in a structured `docs/` directory:
+
+```
+AGENTS.md                    (~100 lines — the map)
+├── Repo overview
+├── Architecture summary (3 sentences)
+├── Key commands (test, lint, build)
+├── Pointer: see docs/architecture.md for system design
+├── Pointer: see docs/testing.md for test patterns
+└── Pointer: see docs/api.md for API conventions
+
+docs/
+├── architecture.md          (loaded when agent works on structure)
+├── testing.md               (loaded when agent writes tests)
+├── api.md                   (loaded when agent works on endpoints)
+├── database.md              (loaded when agent works on schema)
+└── deployment.md            (loaded when agent works on CI/CD)
+```
+
+The agent reads the map at session start, then loads specific documentation on demand. This pattern:
+- Keeps the always-loaded context small (~100 lines ≈ ~300 tokens)
+- Makes detailed docs available without consuming window space constantly
+- Lets the agent decide what's relevant based on the current task
+
+### Cursor's `.mdc` Rules: Glob-Scoped Context
+
+Cursor takes this further with glob-pattern-scoped rules:
+
+```
+.cursor/rules/
+├── python-style.mdc         # Applies when editing *.py files
+├── react-components.mdc     # Applies when editing src/components/**
+├── test-patterns.mdc        # Applies when editing **/*test*
+└── database-migrations.mdc  # Applies when editing migrations/**
+```
+
+Each `.mdc` file has a glob pattern that determines when it's loaded. A rule for React components is only injected when the agent is working on component files. This is context engineering at the framework level — the right instructions appear at the right time without consuming space when they're irrelevant.
+
+## 2.6 The Output Reserve: Why Empty Space Matters
+
+A frequently overlooked budget item is the output reserve: tokens set aside for the model's response. If you fill 195K of a 200K window with input, the model has 5K tokens for its entire response — which might need to include reasoning, a tool call JSON structure, the tool's arguments (potentially a multi-line code edit), and a message to the user.
+
+Claude Code reserves approximately 33,000 tokens:
+- **20,000 tokens** for the model's output (`COMPACT_MAX_OUTPUT_TOKENS`)
+- **13,000 tokens** as buffer for the compaction system (`AUTOCOMPACT_BUFFER_TOKENS`)
+
+When available headroom drops below this reserve, auto-compaction triggers. The reserve is not wasted space — **it is the model's room to think**.
+
+### What Happens Without Sufficient Reserve
+
+```python
+# BAD: No output reserve management
+response = client.messages.create(
+    model="claude-sonnet-4-6",
+    max_tokens=4096,          # Model can generate up to 4K tokens
+    messages=messages_at_198K  # 198K of 200K window used for input
+)
+# Result: Model has 2K tokens (200K - 198K) for output.
+# But you requested 4K. The response will be truncated mid-thought.
+# If the model was generating a tool call, the JSON may be invalid.
+# If it was writing code, the function will be incomplete.
+
+# GOOD: Reserve-aware context management
+MAX_WINDOW = 200_000
+OUTPUT_RESERVE = 33_000
+MAX_INPUT = MAX_WINDOW - OUTPUT_RESERVE  # 167,000
+
+if count_tokens(messages) > MAX_INPUT:
+    messages = compact(messages, target=MAX_INPUT)
+
+response = client.messages.create(
+    model="claude-sonnet-4-6",
+    max_tokens=20_000,
+    messages=messages  # Guaranteed to leave room for response
+)
+```
+
+## 2.7 Putting It Together: The Complete Budget Framework
+
+Here is a complete token budget framework that ties all the components together:
+
+```python
+from dataclasses import dataclass, field
+from typing import Literal
+
+@dataclass
+class ContextBudgetConfig:
+    """Complete context budget configuration for an agent."""
+    
+    model_context_window: int = 200_000
+    max_output_tokens: int = 20_000
+    compaction_buffer: int = 13_000
+    
+    # Fixed costs (measured, not estimated)
+    system_prompt_tokens: int = 3_000
+    tool_definition_tokens: int = 25_000  # Varies by tool set
+    project_memory_tokens: int = 2_000     # CLAUDE.md, rules, etc.
+    
+    @property
+    def effective_window(self) -> int:
+        """Window minus output reserve."""
+        return self.model_context_window - self.max_output_tokens
+    
+    @property
+    def fixed_overhead(self) -> int:
+        """Tokens consumed before any conversation."""
+        return (self.system_prompt_tokens 
+                + self.tool_definition_tokens 
+                + self.project_memory_tokens)
+    
+    @property
+    def available_for_conversation(self) -> int:
+        """Tokens available for history + tool outputs."""
+        return self.effective_window - self.compaction_buffer - self.fixed_overhead
+    
+    @property
+    def overhead_percentage(self) -> float:
+        """What percentage of the nominal window is overhead."""
+        total_overhead = (self.max_output_tokens 
+                         + self.compaction_buffer 
+                         + self.fixed_overhead)
+        return total_overhead / self.model_context_window
+
+@dataclass
+class ContextSnapshot:
+    """Current state of the context window."""
+    config: ContextBudgetConfig
+    history_tokens: int = 0
+    tool_output_tokens: int = 0
+    
+    @property
+    def total_input_tokens(self) -> int:
+        return (self.config.fixed_overhead 
+                + self.history_tokens 
+                + self.tool_output_tokens)
+    
+    @property
+    def utilization(self) -> float:
+        return self.total_input_tokens / self.config.effective_window
+    
+    @property
+    def remaining(self) -> int:
+        return self.config.effective_window - self.total_input_tokens
+    
+    def health(self) -> Literal["healthy", "warning", "compact", "critical"]:
+        u = self.utilization
+        if u >= 0.98:
+            return "critical"
+        elif u >= 0.92:
+            return "compact"
+        elif u >= 0.82:
+            return "warning"
+        return "healthy"
+
+
+# Example: assess a Claude Code session at turn 40
+config = ContextBudgetConfig()
+snapshot = ContextSnapshot(
+    config=config,
+    history_tokens=80_000,
+    tool_output_tokens=50_000
+)
+
+print(f"Total input: {snapshot.total_input_tokens:,} tokens")
+print(f"Utilization: {snapshot.utilization:.1%}")
+print(f"Remaining: {snapshot.remaining:,} tokens")
+print(f"Health: {snapshot.health()}")
+print(f"Overhead: {config.overhead_percentage:.1%} of nominal window")
+
+# Output:
+# Total input: 160,000 tokens
+# Utilization: 88.9%
+# Remaining: 20,000 tokens
+# Health: compact
+# Overhead: 31.5% of nominal window
+```
+
+### The Four-Component Budget Rule
+
+Every inference call's input can be decomposed into exactly four components. When designing your agent, allocate explicitly:
+
+```
+TOTAL INPUT BUDGET = EFFECTIVE WINDOW - COMPACTION BUFFER
+
+Component 1: SYSTEM (fixed)
+  = system_prompt + tool_definitions + project_memory
+  Target: < 15% of nominal window
+
+Component 2: USER (current turn)
+  = current user message + any injected context (RAG results, etc.)
+  Target: < 10% of nominal window per turn
+
+Component 3: HISTORY (accumulated)
+  = all previous conversation turns
+  Target: managed via compaction to stay < 50% of effective window
+
+Component 4: OUTPUT RESERVE (held back)
+  = max_output_tokens
+  Target: 10-15% of nominal window
+```
+
+If any single component exceeds its target, it's eating into the others. Tool definitions at 30% means conversation history gets squeezed. History at 60% means no room for large tool outputs. The budget must balance.
 
 ## 2.8 Key Takeaways
 
-1. **The context window has exactly one pile.** System prompt, tools, history, outputs, and the model's own response all compete for the same tokens.
+1. **31% of a 200K window is consumed by fixed overhead** (output reserve + compaction buffer + system prompt + tools + project memory) before any conversation begins. For 128K windows, this ratio is even worse.
 
-2. **Tool definitions are the largest hidden tax.** 40 tools can consume 45% of a 128K window on *every* inference call, whether or not they're used. Dynamic tool loading is not optional at scale.
+2. **Tool definitions are the largest hidden tax.** Each tool costs 550–1,400 tokens. 40 tools can consume 34K tokens per call. With MCP servers, a Jira server alone costs ~17K tokens. Use deferred loading (`defer_loading: True`) or dynamic tool filtering to cut this by 85%+.
 
-3. **Conversation history grows without bound** and is the primary driver of context pressure in long-running sessions. Summarize-and-slide is the minimum viable strategy.
+3. **Tool selection accuracy degrades from ~92% at 5 tools to ~49% at 50+ tools.** This is both a cost and quality problem. Fewer tools in context means better tool selection.
 
-4. **Tool outputs are spiky and re-fetchable.** Store them externally and keep only summaries or references in the context window.
+4. **Conversation history grows at 5,000–15,000 tokens/turn** for tool-using agents. A full coding agent hits 70% utilization in 5–10 turns. Compaction is not an edge case — it's routine.
 
-5. **Project memory should be a map, not an encyclopedia.** Keep it short, structured, and pointing to deeper documentation that can be loaded on demand.
+5. **Tool outputs are the most compressible component** because they're re-fetchable. Old file reads and search results should be replaced with summaries or file references. Keep the "hot tail" (most recent outputs) verbatim.
 
-6. **Always reserve output headroom.** The model needs room to think. A full context window with no output reserve is a failed request.
+6. **Project memory should be a map, not an encyclopedia.** Keep `CLAUDE.md`/`AGENTS.md` under 500 lines. Point to deeper docs that are loaded on demand. Cursor's glob-scoped `.mdc` rules are the gold standard for this pattern.
+
+7. **Always reserve output headroom.** Claude Code reserves 33K tokens (20K output + 13K buffer). Without this, the model's response gets truncated, tool call JSON can be invalid, and code output can be incomplete.
