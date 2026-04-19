@@ -601,6 +601,237 @@ Claude Code exposes 17 lifecycle hook events for governance and automation, conf
 
 Hooks can **block actions** (exit non-zero to prevent tool execution), **inject context** (stdout is appended to the conversation), and **run arbitrary scripts** (linters, formatters, security scanners). This makes Claude Code extensible without modifying the harness itself.
 
+### Source Code Leak and Architecture Overview
+
+On March 31, 2026, Anthropic shipped Claude Code v2.1.88 with a 59.8 MB source map that exposed 512K lines of TypeScript across 1,906 files. This was not a deliberate open-source release — it was a bundled `.js.map` file that contained the complete, unbundled source tree. The resulting reverse engineering effort produced the most detailed public analysis of any commercial AI agent's internals.
+
+The fundamental insight from the source analysis: **Claude Code is not a chatbot with shell access — it's an orchestration engine** (an "agentic harness") where the intellectual property lives in the harness, not the model weights. The model is a component. The architecture around it — tool dispatch, permission enforcement, compaction logic, multi-agent coordination, memory management, feature flags — is where the real engineering resides.
+
+**Runtime:** Bun (not Node.js). **UI:** Ink (React for terminals) — a custom React Fiber reconciler with Yoga flex-layout. **Language:** Fully TypeScript, end to end.
+
+### The Agent Loop (TAOR Pattern)
+
+Claude Code's agent loop follows the **Think, Act, Observe, Repeat** pattern, implemented as a streaming async generator:
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│                    CLAUDE CODE AGENT LOOP                      │
+│                                                              │
+│  query() → yields StreamEvent | Message                      │
+│                                                              │
+│  ┌──────────┐    ┌──────────┐    ┌──────────┐               │
+│  │  THINK   │───►│   ACT    │───►│ OBSERVE  │───► REPEAT    │
+│  │          │    │          │    │          │       │        │
+│  │ Model    │    │ Execute  │    │ Feed     │       │        │
+│  │ produces │    │ tool_use │    │ results  │       │        │
+│  │ text +   │    │ blocks   │    │ back     │       │        │
+│  │ tool_use │    │          │    │          │       │        │
+│  └──────────┘    └──────────┘    └──────────┘       │        │
+│       ▲                                              │        │
+│       └──────────────────────────────────────────────┘        │
+│                                                              │
+│  Loop terminates when: stop_reason = "end_turn"              │
+│  Compaction check: runs AFTER each API round                 │
+└──────────────────────────────────────────────────────────────┘
+```
+
+The model produces text and/or `tool_use` blocks. The agent executes those tool calls and feeds results back. The loop continues until the model returns `stop_reason = "end_turn"` (no more tool calls, response complete).
+
+**Tool execution concurrency** is partitioned by safety:
+
+- **Read tools** (FileRead, Grep, Glob, WebSearch, WebFetch) run in **parallel**, up to 10 concurrent operations
+- **Write tools** (FileEdit, FileWrite, Bash) run **serially** — one at a time, in order
+- **Sibling error handling:** If one parallel tool errors, its siblings are aborted via the AbortController. This prevents partial state from parallel reads that failed midway.
+
+### Multi-Agent Orchestration (3 Levels)
+
+The source reveals three distinct levels of multi-agent capability, each progressively more complex:
+
+**Level 1: Sub-Agent (AgentTool)**
+
+The simplest multi-agent pattern. `AgentTool` spawns an isolated child agent:
+
+- **Isolated file cache** — cloned from parent, not shared (prevents cache corruption)
+- **Independent AbortController** — parent can cancel child without affecting its own operations
+- **Filtered tool pool** — child receives a subset of tools appropriate for its task
+- **Returns text to parent** — the child's full trajectory is summarized; parent never sees raw conversation
+
+**Level 2: Coordinator Mode (`CLAUDE_CODE_COORDINATOR_MODE=1`)**
+
+When this environment variable is set, the system prompt is rewritten for orchestration rather than direct execution. The coordinator:
+
+- Spawns **workers** with restricted tool sets (e.g., a worker might only get FileRead + Grep for investigation)
+- Uses an **XML task-notification protocol** for structured communication between coordinator and workers
+- Plans and delegates rather than executing directly
+
+**Level 3: Team Mode**
+
+Full multi-agent teams with persistent identities:
+
+- `TeamCreateTool` creates named teams persisted to `~/.claude/teams/{name}.json`
+- `InProcessTeammates` manages agent lifecycle within the same process
+- `SendMessageTool` routes messages between agents
+- **Shared scratchpad filesystem** for inter-agent data sharing
+- **Structured shutdown protocol** for graceful team termination
+
+**Fork Sub-Agent optimization:** When multiple agents need to be spawned from the same conversation context, Claude Code **forks** them to maximize prompt cache hits. All forked agents share the same conversation prefix (cache HIT) — only the final directive message differs. This means spawning 5 sub-agents costs barely more in cache misses than spawning 1.
+
+**Inter-agent communication** uses three mechanisms:
+- **In-process:** `queuePendingMessage` for agents in the same process
+- **File-based:** JSON mailbox files at `~/.claude/work/ipc/` with 500ms polling interval
+- **Broadcast:** `to="*"` sends to all agents in a team
+
+### AutoDream: Background Memory Consolidation
+
+AutoDream is Claude Code's background memory consolidation system — it works like human REM sleep, periodically consolidating session learnings into persistent memory files.
+
+**Five-gate trigger mechanism** (checked in order of increasing cost — cheap checks first to avoid unnecessary expensive checks):
+
+1. **Feature toggle** — enabled, not in KAIROS mode, not remote, autoMemory flag on
+2. **Time gate** — 24 hours since last consolidation
+3. **Scan throttle** — 10-minute interval between scan attempts
+4. **Session gate** — 5+ accumulated sessions since last consolidation
+5. **Lock gate** — PID lock file ensures no other process is consolidating
+
+All five gates must pass before consolidation begins. The ordering is deliberate: the feature toggle check is essentially free; the lock gate requires filesystem operations. By the time the expensive checks run, the cheap checks have already filtered out most invocations.
+
+**Four-phase consolidation:**
+
+```
+Phase 1: Orient
+  ├── List memory directory contents
+  ├── Read memory index file
+  └── Browse existing memory files to understand current state
+
+Phase 2: Gather Recent Signal
+  ├── Read daily session logs
+  ├── Identify drifted memories (memories that no longer match reality)
+  └── Search transcripts for patterns worth remembering
+
+Phase 3: Consolidate
+  ├── Write new memory files for novel learnings
+  ├── Update existing memory files with new signal
+  └── Convert relative dates to absolute ("yesterday" → "2026-03-30")
+
+Phase 4: Prune and Index
+  ├── Update MEMORY.md index file
+  ├── Remove stale pointers to deleted or outdated memories
+  └── Keep total memory under ~25KB
+```
+
+The date conversion in Phase 3 is a subtle but important detail: memories that say "yesterday the user mentioned..." become meaningless after a week. Converting to absolute dates makes memories durable.
+
+Source files: `src/services/autoDream/autoDream.ts`, `consolidationPrompt.ts`, `consolidationLock.ts`.
+
+### Tool System (40+ Tools)
+
+Claude Code ships 36+ tool definitions with read/write concurrency separation. Each tool implements a standard interface:
+
+```typescript
+interface Tool {
+    name: string;
+    description: string;
+    inputJSONSchema: JSONSchema;
+    call(input: unknown): Promise<ToolResult>;
+    validateInput(input: unknown): ValidationResult;
+    checkPermissions(input: unknown): PermissionResult;
+    isConcurrencySafe(): boolean;   // true = can run in parallel
+    isReadOnly: boolean;            // true = no side effects
+    shouldDefer: boolean;           // true = load on demand, not at startup
+    alwaysLoad: boolean;            // true = always in prompt
+}
+```
+
+**Core tools** (always loaded into the system prompt):
+BashTool, FileReadTool, FileEditTool, FileWriteTool, GlobTool, GrepTool, AgentTool, SkillTool, TaskCreate/Get/Update/List, WebFetch, WebSearch, ToolSearchTool, SendMessageTool
+
+**Feature-gated tools** (loaded when specific feature flags are enabled):
+MonitorTool, TeamCreate/Delete, CronCreate/Delete, WorkflowTool, WebBrowserTool, SnipTool
+
+**Deferred tools** (loaded on demand via ToolSearchTool):
+All MCP tools + any tool with `shouldDefer=true`. These tools' names and descriptions are indexed but their full schemas are not in the prompt until the model requests them.
+
+**ToolSearch algorithm:**
+- `select:X` — exact match, loads tool X immediately
+- `+keyword` — required keyword, results must contain it
+- Keyword scoring: exact name part match gets +12 (MCP) or +10 (regular); substring match gets +6/+5; description match gets +2
+- MCP tool naming convention: `mcp__{server}__{tool}` (double underscore separators)
+
+### Permission and Safety System
+
+Every tool call passes through a multi-layer permission pipeline before execution:
+
+```
+Tool call → Mode check → Apply rules (deny/allow/ask) → 
+Auto-mode LLM classifier → Mode-specific default → Execute or Block
+```
+
+**Permission modes:**
+| Mode | Symbol | Behavior |
+|------|--------|----------|
+| Default | `>` | Ask for write operations, allow reads |
+| AcceptEdits | `>>` | Auto-allow file edits, ask for others |
+| Plan | `?` | Read-only, no write operations |
+| BypassPermissions | `!` | Allow everything (dangerous) |
+| Auto | `A` | LLM classifier decides |
+
+**Auto-mode: Two-stage YOLO classifier:**
+
+- **Stage 1:** 64-token fast scan at temperature 0. Quick heuristic check — most tool calls are obviously safe or obviously dangerous
+- **Stage 2:** 4,096-token reasoning at temperature 0. Full analysis for ambiguous cases
+- **Circuit breaker:** >3 consecutive denials or >20 total denials → fall back to ASK mode (require human approval). This prevents the agent from getting stuck in a deny loop
+
+**Seven-layer defense-in-depth** with 23 Bash validators that check for:
+- **Dangerous files blocked:** `.gitconfig`, `.bashrc`, `.zshrc`, `.mcp.json` — files that could compromise the user's environment
+- **Auto-mode command stripping:** `python`, `node`, `bash`, `npm run` — commands that could execute arbitrary code are blocked in auto-mode, requiring explicit user approval
+
+### Feature Flags and Hidden Systems
+
+Claude Code is controlled by **88+ feature flags** via GrowthBook, plus **600+ runtime flags** prefixed `tengu_`. The `tengu_` prefix appears throughout the codebase as the internal codename.
+
+**Hidden/experimental features revealed in the source:**
+- **KAIROS** — a proactive mode where Claude Code initiates actions without user prompts
+- **UltraPlan** — an extended planning mode for complex multi-step tasks
+
+**Terminal UI architecture:**
+The Ink-based terminal UI uses a custom React Fiber reconciler with Yoga flex-layout for terminal rendering. The screen buffer uses packed `Int32Array`s for efficient memory usage. Frame-diffing reduces data transfer: on an idle screen, a full 10KB buffer diffs to approximately 50 bytes (only the cursor blink changes).
+
+### Token Counting Methods
+
+The source reveals four distinct token counting strategies, used in different contexts based on the accuracy-speed tradeoff:
+
+| Method | Accuracy | Speed | Use Case |
+|--------|----------|-------|----------|
+| API token count | Exact | Slow (requires API call) | Pre-compaction decisions |
+| characters / 4 | ~85% | Instant | New message estimation |
+| characters / 2 | ~85% for JSON | Instant | JSON-heavy content (tool schemas, structured output) |
+| Fixed 2,000 tokens | N/A | Instant | Images and documents (constant budget) |
+
+The `characters / 2` heuristic for JSON reflects that JSON is token-dense: braces, quotes, colons, and commas each consume a token but only 1–2 characters. Natural language averages ~4 characters per token; JSON averages closer to 2.
+
+### Persistent Memory Architecture
+
+The memory system uses a structured directory under the project path:
+
+```
+~/.claude/projects/<project>/memory/
+├── MEMORY.md          ← Index file (max 200 lines, pointers to memory files)
+├── user_role.md       ← User type: role, preferences
+├── feedback_testing.md ← Feedback type: behaviors to repeat/avoid
+├── project_auth.md    ← Project type: ongoing work context
+└── reference_docs.md  ← Reference type: external system pointers
+```
+
+Each memory file has YAML frontmatter with `name`, `description`, and `type` fields. The type system (`user`, `feedback`, `project`, `reference`) determines how the memory is used during context assembly — user memories are always loaded, feedback memories are loaded when the agent is about to repeat an action it previously received feedback on, project memories provide ongoing context.
+
+**File State Cache:** The QueryEngine maintains an LRU file cache — max 100 files, max 25MB total. Each entry tracks:
+- File content (the actual text)
+- Timestamp (when it was last read)
+- Partial view flag (whether only a portion was read)
+- Raw content for edits (the unmodified content, used for diff generation)
+
+This cache prevents redundant file reads: if the agent read a file 3 turns ago and the file hasn't been modified, the cached version is used instead of hitting the filesystem again.
+
 ## 11.3 Cursor
 
 ### Semantic Index with Merkle Trees
@@ -1154,7 +1385,7 @@ The Managed Agents architecture establishes several principles:
 | Feature | Codex | Claude Code | Cursor | Devin | Manus | Managed Agents |
 |---------|-------|-------------|--------|-------|-------|----------------|
 | **Compaction** | | | | | | |
-| Server-side compaction | ✓ (Responses API) | ✓ (4-tier) | ✓ | — | — | ✓ (model-dependent) |
+| Server-side compaction | ✓ (Responses API) | ✓ (5-tier) | ✓ | — | — | ✓ (model-dependent) |
 | Local summarization | ✓ (fallback) | ✓ (compact.ts) | ✓ | ✓ | ✓ | ✓ (Opus 4.6 only) |
 | Microcompaction | — | ✓ (outputs→files) | ✓ (outputs→files) | — | ✓ (outputs→files) | — |
 | Context awareness | — | ✓ (model-native) | — | ✓ (anxiety) | — | ✓ (model-specific) |
@@ -1164,14 +1395,15 @@ The Managed Agents architecture establishes several principles:
 | Cross-session store | — | ✓ (memory tool) | — | ✓ (session search) | — | ✓ (event log replay) |
 | Hierarchical config | ✓ (AGENTS.md→docs/) | ✓ (4-level CLAUDE.md) | ✓ (4 rule types) | ✓ (notes→playbooks) | — | — |
 | **Multi-Agent** | | | | | | |
-| Parallel subagents | ✓ (max 6) | ✓ | ✓ | ✓ (managed Devins) | ✓ | ✓ (brain-to-brain) |
+| Parallel subagents | ✓ (max 6) | ✓ (3 levels) | ✓ | ✓ (managed Devins) | ✓ | ✓ (brain-to-brain) |
 | Subagent depth | 1 (hard limit) | configurable | configurable | 1 (coordinator) | 1 | configurable (3-agent shown) |
 | Isolated VMs | — | — | — | ✓ | ✓ | ✓ (containers as hands) |
 | Hand passing | — | — | — | — | — | ✓ (brains share hands) |
+| Team mode | — | ✓ (persistent teams) | — | — | — | — |
 | **Dynamic Loading** | | | | | | |
-| Dynamic tool loading | — | — | ✓ (46.9% savings) | — | ✓ (logit masking) | — |
-| Tool search | — | — | — | — | — | — |
-| Skill system | ✓ | — | ✓ (MDC format) | ✓ (playbooks) | — | — |
+| Dynamic tool loading | — | ✓ (ToolSearchTool) | ✓ (46.9% savings) | — | ✓ (logit masking) | — |
+| Tool search | — | ✓ (keyword scoring) | — | — | — | — |
+| Skill system | ✓ | ✓ (SkillTool) | ✓ (MDC format) | ✓ (playbooks) | — | — |
 | **Cache Optimization** | | | | | | |
 | Stable prefix design | ✓ | ✓ | ✓ | — | ✓ (highest priority) | — |
 | Prompt caching API | ✓ | ✓ | ✓ | — | ✓ | ✓ |
@@ -1186,6 +1418,9 @@ The Managed Agents architecture establishes several principles:
 | Todo recitation | — | — | — | — | ✓ (attention anchor) | — |
 | Brain/hand separation | — | — | — | — | — | ✓ (core architecture) |
 | Failure independence | — | — | — | — | — | ✓ (per-interface) |
+| Background memory (AutoDream) | — | ✓ (5-gate trigger) | — | — | — | — |
+| Permission classifier | — | ✓ (2-stage YOLO) | — | — | — | — |
+| Feature flags | — | ✓ (88+ GrowthBook) | — | — | — | — |
 
 ### Where They Converge
 
@@ -1199,7 +1434,7 @@ Every system, without exception:
 ### Where They Diverge
 
 - **Codex** bets on architectural enforcement. Rigid layers + custom linters + structural tests. The agent has maximum autonomy within precisely defined constraints.
-- **Claude Code** bets on graduated compaction. Four tiers of progressive compression, cache-aware summarization, and 17 programmable hooks. The most nuanced context management of any system.
+- **Claude Code** bets on graduated compaction and deep orchestration. Five tiers of progressive compression, cache-aware summarization, three levels of multi-agent coordination, background memory consolidation (AutoDream), 40+ tools with deferred loading, a two-stage permission classifier, and 17 programmable hooks. The most nuanced context management of any system — and the source leak confirms it's also the most complex.
 - **Cursor** bets on dynamic discovery. The semantic index + dynamic loading + 4 rule types create the most sophisticated context assembly pipeline.
 - **Devin** bets on full isolation + institutional memory. Each managed Devin gets its own VM; persistent knowledge tips and playbooks accumulate organizational wisdom across all sessions.
 - **Manus** bets on KV-cache efficiency. Every design decision optimizes for cache hit rate: stable prefixes, append-only context, deterministic serialization, logit masking instead of prompt modification.

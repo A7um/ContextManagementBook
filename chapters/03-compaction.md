@@ -12,7 +12,48 @@ The quality of the summary determines whether the agent continues its task coher
 
 ## 3.2 Claude Code: Exact Thresholds from Source Code
 
-Claude Code has the most documented multi-tier compaction system in production. The following constants are taken directly from the source code:
+Claude Code has the most documented multi-tier compaction system in production. The March 2026 source leak (v2.1.88, 512K lines of TypeScript across 1,906 files) revealed the complete compaction architecture, centered on the QueryEngine module.
+
+### QueryEngine: The Central Module
+
+`QueryEngine.ts` (~1,296+ lines) is the central module for each conversation session. It holds:
+
+- **Mutable message history** — the conversation array that compaction operates on
+- **Abort controller** — for cancelling in-progress operations
+- **Usage tracking** — token counts, API call metrics
+- **File state cache** — LRU cache, max 100 files, max 25MB total, tracks content + timestamp + partial view flag + raw content for edits
+
+The agent loop is a streaming async generator: `query()` yields `StreamEvent | Message` as they arrive from the API. The compaction check runs **after each API round** — not on a timer, not on a message count, but after every model response.
+
+### Supporting Compaction Files
+
+The full compaction subsystem spans eight files:
+
+| File | Lines | Purpose |
+|------|-------|---------|
+| `compact.ts` | 1,706 | Core compaction logic, summary generation |
+| `autoCompact.ts` | 352 | Threshold monitoring, trigger logic |
+| `microCompact.ts` | 531 | Large tool output compression |
+| `sessionMemoryCompact.ts` | 631 | Session memory extraction |
+| `prompt.ts` | 375 | Compaction prompt construction |
+| `grouping.ts` | 64 | Message grouping for compaction |
+| `postCompactCleanup.ts` | 100 | Post-compaction cleanup |
+| `apiMicrocompact.ts` | 140 | API-based microcompaction |
+
+### System Prompt Structure and Cache Preservation
+
+The system prompt is 30–40K tokens, split into **7 static cached sections** and **13 dynamic sections**. Two functions control section creation:
+
+- `systemPromptSection()` — memoized/cached, used for stable content
+- `DANGEROUS_uncachedSystemPromptSection()` — the naming is intentional, a deliberate flag to warn developers that calling this function creates content that breaks the prompt cache
+
+A boundary marker separates static (cacheable) from dynamic (per-session) content. Everything above the boundary is stable across turns and benefits from Anthropic's prompt caching. Everything below changes per-session (environment info, active tools, hooks output).
+
+The cache-preservation design extends to compaction itself: when generating a summarization, Claude Code reuses the **exact same system prompt, tools, and model** as the main conversation, appending the compaction instruction as a new user message. This means the summarization call hits the same cache key as the main conversation. Testing showed that using a different system prompt for summarization had a **98% cache miss rate** — the cost difference is enormous at 30–40K tokens of system prompt.
+
+### Exact Threshold Constants
+
+The following constants are taken directly from the source code:
 
 ```typescript
 // Core window constants
@@ -105,7 +146,7 @@ async function attemptCompaction(): Promise<boolean> {
 
 This prevents a pathological loop where the conversation is too degraded for the model to produce a good summary, the summary is rejected, and the system retries compaction endlessly. After 3 failures, the system falls through to the hard stop, which blocks further execution rather than continuing with a compromised context.
 
-## 3.3 Claude Code's Four-Tier Compaction System
+## 3.3 Claude Code's Five-Tier Compaction System
 
 ### Tier 1: MicroCompact — Surgical Tool Output Clearing
 
@@ -133,11 +174,21 @@ function microCompact(
 }
 ```
 
-**What gets cleared**: Read, Bash, Grep, Glob, WebSearch, WebFetch, Edit, Write tool outputs older than the hot tail.
+**Compactable tools list** (from source): FileRead, Bash, PowerShell, Grep, Glob, WebSearch, WebFetch, FileEdit, FileWrite. Only outputs from these tools are eligible for clearing.
 
 **What stays**: The most recent N tool results (the hot tail), all user messages, all assistant messages (including tool *calls*), all system content.
 
 **Cost**: Zero LLM tokens. This is pure string manipulation on the message array.
+
+#### MicroCompact Has Two Paths
+
+The source reveals that MicroCompact is not a single mechanism — it has two distinct execution paths depending on cache state:
+
+**Path A — Time-Based (cache cold):** Directly mutates message content in the conversation array. Older tool results are replaced with `[Old tool result content cleared]`. This is the simple path: scan messages by age, replace content, done.
+
+**Path B — Cache-Warm (Anthropic-only):** When the prompt cache is warm, MicroCompact uses the `cache_edits` API to surgically delete specific tool results **by `tool_use_id`** without touching the cached prefix. This is critical: Path A would invalidate the cache by modifying messages that are part of the cached prefix. Path B preserves the cache by instructing the API to skip specific content blocks during the next inference call.
+
+The choice between paths is automatic. If the conversation is running against Anthropic's API and the cache is warm, Path B is used. Otherwise, Path A fires.
 
 ### Tier 2: AutoCompact — Full Summarization
 
@@ -172,15 +223,21 @@ function calculateTokenWarningState(
 }
 ```
 
-The summarization prompt is not an open-ended "summarize this conversation." It's a structured contract. The summary must contain:
+The summarization prompt is not an open-ended "summarize this conversation." It's a structured contract requiring **9 specific sections** (from the source code's compaction prompt):
 
-1. **Original intent**: What the user originally asked for
-2. **Decisions made**: Architectural choices, library selections, approach decisions
-3. **Completed work**: Files modified, tests written, features implemented
-4. **Failed approaches**: What was tried and didn't work (critical to avoid loops)
-5. **Current state**: What the agent is in the middle of doing right now
-6. **Pending work**: What still needs to be done
-7. **Key file paths**: Files the agent was actively working with
+1. **Primary Request and Intent** — what the user originally asked
+2. **Key Technical Concepts** — important technical details discussed
+3. **Files and Code Sections** — files touched, what was read/written/modified
+4. **Errors and Fixes** — what went wrong and how it was resolved
+5. **Problem Solving** — approaches tried, what worked/didn't
+6. **All User Messages** — preserve every user message verbatim
+7. **Pending Tasks** — what's left to do
+8. **Current Work** — what was being worked on when compaction fired
+9. **Optional Next Step** — recommended next action
+
+Section 6 is notable: **every user message is preserved verbatim** in the summary. This is more aggressive than most summarization approaches, which paraphrase user messages. The rationale is that user intent expressed in their exact words is too important to risk paraphrasing — a subtle rephrasing could shift the meaning of a nuanced instruction.
+
+**The No-Tools Preamble:** The summarization call inherits the parent conversation's full tool set (because it reuses the same system prompt for cache efficiency). To prevent the model from calling tools during summarization — which would be catastrophic — the compaction prompt includes a preamble that explicitly instructs the model to produce only text output. This is a necessary safeguard when reusing a tool-rich system prompt for a task that should be pure text generation.
 
 After summarization, Claude Code performs **rehydration**:
 
@@ -251,6 +308,42 @@ if (warningState === "blocking") {
 ```
 
 This is a safety valve. Continuing with a critically full window would mean the model has almost no room to respond, tool call JSON might be truncated (causing parse errors), and any output would be working with the worst possible context quality (maximum degradation).
+
+### Tier 5: Reactive Compact — Emergency Recovery
+
+The source code reveals a fifth tier not previously documented: **Reactive Compact**. This is distinct from the hard stop — it's an active recovery mechanism, not a passive block.
+
+Reactive Compact triggers when the API returns a `prompt_too_long` error — meaning the context has exceeded what the API will accept, even after all other compaction tiers have run (or failed to run in time). The recovery sequence:
+
+1. **Truncate oldest message groups** — not individual messages, but logical groups (a user message + the assistant response + tool results it generated)
+2. **Retry the API call** with the reduced context
+3. If still too long, truncate more groups and retry again
+
+This is the "last resort before giving up" path. It's more aggressive than auto-compact (which summarizes) — Reactive Compact simply drops old content without summarization. The information is lost, not compressed. But it keeps the agent running when the alternative is a complete halt.
+
+The existence of this tier means Claude Code has five levels of defense against context overflow, not four:
+
+```
+MicroCompact → AutoCompact → SessionMemory → HardStop → ReactiveCompact
+   (cheap)      (LLM call)    (extract)     (block)     (emergency truncate)
+```
+
+The HardStop blocks *proactively* (before the API call). Reactive Compact fires *reactively* (after the API rejects the call). Together they cover both the "we predict overflow" and "overflow happened anyway" cases.
+
+### Post-Compaction Reconstruction Sequence (from Source)
+
+After full compaction (Tier 2) fires, Claude Code doesn't just inject the summary — it reconstructs a complete working context in a specific order:
+
+1. **Boundary marker** with pre-compaction metadata (token counts, turn counts, timestamp)
+2. **The formatted 9-section summary** (from the summarization call)
+3. **5 most recently read files**, capped at 50K tokens total — re-read from disk, not from the summary
+4. **Re-injected skills** sorted by recency — skills the agent used recently are restored first
+5. **Tool definitions re-announced** — full tool schemas so the model knows its capabilities
+6. **Session hooks re-run** — PreToolUse/PostToolUse hooks re-executed to restore hook state
+7. **CLAUDE.md restored at system level** — project instructions re-injected
+8. **Continuation message**: `"This session is being continued from a previous conversation that ran out of context... Please continue without asking the user any further questions. Continue with the last task."`
+
+The continuation message is carefully worded: "without asking the user any further questions" prevents the common failure mode where the model, disoriented after compaction, asks the user to re-explain what they want. The instruction to "continue with the last task" ensures the model picks up where it left off rather than starting fresh.
 
 ## 3.4 OpenAI Codex Compaction: Source Analysis
 
@@ -726,7 +819,7 @@ async def compact_with_diagnostics(
 
 1. **Know your exact thresholds.** Claude Code: auto-compact at 167K tokens (92.8% of effective window). Warning at 147K (81.7%). Hard stop at 177K (98.3%). Codex: configurable threshold, default ~200K. Build monitoring around these numbers.
 
-2. **Multi-tier compaction outperforms single-pass.** Claude Code's four layers (MicroCompact → AutoCompact → SessionMemory → HardStop) provide progressively more aggressive management. MicroCompact handles 80% of cases with zero LLM cost.
+2. **Multi-tier compaction outperforms single-pass.** Claude Code's five layers (MicroCompact → AutoCompact → SessionMemory → HardStop → ReactiveCompact) provide progressively more aggressive management. MicroCompact handles 80% of cases with zero LLM cost. ReactiveCompact provides emergency recovery when all else fails.
 
 3. **Compaction is summarization plus rehydration.** The summary alone is insufficient. Re-reading current files, restoring plan state, and injecting a continuation instruction are what make compaction work in practice.
 
