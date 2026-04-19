@@ -134,6 +134,30 @@ The key design decisions:
 
 When the metrics show a problem, the first response shouldn't be "let me try X" — it should be "what does the metric pattern tell me about the cause?" A short decision tree for the common failures.
 
+```mermaid
+flowchart TD
+    P[Symptom] --> Q1{High cost?}
+    Q1 -->|Yes| Q2{Cache hit rate<br/>below 50%?}
+    Q2 -->|Yes| F1["🔧 Unstable prefix<br/>Check for timestamps,<br/>session IDs, non-deterministic<br/>JSON serialization"]
+    Q2 -->|No| F2["🔧 Context bloat<br/>Audit tool count,<br/>tool output accumulation"]
+
+    P --> Q3{Frequent compaction?}
+    Q3 -->|Yes| F3["🔧 Context pressure<br/>Move tool outputs to files,<br/>clear old results,<br/>add external memory"]
+
+    P --> Q4{Good cache,<br/>poor quality?}
+    Q4 -->|Yes| F4["🔧 Attention problem<br/>Move critical content<br/>to beginning or end,<br/>remove middle clutter"]
+
+    P --> Q5{Quality degrades<br/>late in session?}
+    Q5 -->|Yes| F5["🔧 Context rot<br/>Add state files,<br/>measure at 60/70/80%,<br/>consider sub-agents"]
+
+    style F1 fill:#dcfce7
+    style F2 fill:#dcfce7
+    style F3 fill:#dcfce7
+    style F4 fill:#dcfce7
+    style F5 fill:#dcfce7
+```
+*A diagnostic decision tree. Each path leads to a distinct fix — context engineering problems look similar from the outside but need very different remedies.*
+
 **High cost, low cache hit rate → unstable prefix.** Inspect the system prompt and tool definitions for non-determinism. Common culprits: timestamps in the system prompt, session IDs in the prefix, JSON serialization that doesn't sort keys, dynamic tool ordering, model-version strings rendered into the prompt. Each of these flips a token at some position N, invalidating the cache from N onward. Fix by moving dynamic content to the end of the prompt and ensuring the static prefix is byte-stable across calls.
 
 **Frequent compaction → tools or context bloat.** The model is being asked to handle more than it can comfortably hold. Audit: how many tools are loaded per turn? How long is the conversation history? Is the system prompt within bounds? Either reduce the per-turn context (Chapter 4 on context editing, Chapter 11 on external memory) or use sub-agents (Chapter 13) to isolate work.
@@ -165,6 +189,24 @@ The placebo trap: it's surprisingly easy to convince yourself a change is helpin
 ## 14.6 The Iteration Loop
 
 A simple six-step loop, easy to remember and easy to violate.
+
+```mermaid
+flowchart LR
+    I[Instrument] --> B[Baseline]
+    B --> H[Hypothesize]
+    H --> C[Change ONE thing]
+    C --> M[Measure delta]
+    M --> D{Improved?}
+    D -->|Yes| K[Keep + iterate]
+    D -->|No| R[Revert]
+    K --> H
+    R --> H
+
+    style I fill:#dbeafe
+    style K fill:#dcfce7
+    style R fill:#fecaca
+```
+*The iteration loop. Change one thing at a time, measure, keep or revert. Context engineering is empirical — "Stochastic Graduate Descent" as Manus's team calls it.*
 
 1. **Instrument.** Add metrics for everything you care about. If you can't see it, you can't change it.
 2. **Baseline.** Measure current state on real workload. Don't trust your intuition about where things stand.

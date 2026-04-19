@@ -236,6 +236,33 @@ Token usage
 └─────────────┴──────────────┴──────────────┴───────────┘
 ```
 
+```mermaid
+stateDiagram-v2
+    [*] --> Normal: Session starts
+    Normal --> MicroCompact: Tool output exceeds size
+    MicroCompact --> Normal: Context reclaimed
+
+    Normal --> Warning: tokens ≥ 147K (81.7%)
+    Warning --> AutoCompact: tokens ≥ 167K (92.8%)
+    AutoCompact --> Normal: Summary injected<br/>files re-read
+
+    Normal --> SessionMemory: Repeated compaction pressure
+    SessionMemory --> Normal: Facts persisted<br/>to disk
+
+    Normal --> HardStop: tokens ≥ 177K (98.3%)
+    HardStop --> [*]: User must act
+
+    AutoCompact --> Reactive: API rejects<br/>prompt_too_long
+    Reactive --> Normal: Aggressive truncation
+    Reactive --> HardStop: Still too large
+
+    note right of AutoCompact
+        Max 3 consecutive failures
+        → circuit breaker trips
+    end note
+```
+*Claude Code's compaction as a state machine. MicroCompact runs continuously; AutoCompact triggers at 92.8%; SessionMemory extracts durable facts; Reactive handles API rejections; HardStop is the final brake.*
+
 ### Tier 1: MicroCompact (covered in Chapter 9)
 
 The lowest-threshold tier is MicroCompact, which is a **clearing** mechanism rather than a compaction mechanism. It replaces old tool-result content with placeholders and has two execution paths (cache-warm via `cache_edits`, cache-cold via direct mutation). The full details are in §9.6. MicroCompact absorbs most context pressure in normal operation — many production sessions never exceed Tier 1 at all.
@@ -394,6 +421,29 @@ Rules:
 The under-documented half of compaction is what happens *after* the summary is generated. A summary alone is not a usable working context. The agent's next turn needs tools, memory, file state, skills, and project instructions — all of which were in the prior turn's context but not in the summary.
 
 Claude Code's source shows the full reconstruction sequence in a specific order:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Old as Pre-compaction context
+    participant Sum as Summarizer
+    participant New as New context window
+
+    Old->>Sum: Send messages to summarize
+    Sum->>Sum: Generate 9-section summary<br/>(intent, concepts, files,<br/>errors, problem-solving, messages,<br/>pending, current work, next step)
+    Sum->>New: 1. Boundary marker with metadata
+    Sum->>New: 2. Formatted 9-section summary
+    Note over New: Restoration begins
+    Sum->>New: 3. Re-read 5 most recent files<br/>(capped at 50K tokens)
+    Sum->>New: 4. Re-inject skills (sorted by recency)
+    Sum->>New: 5. Re-announce tool definitions
+    Sum->>New: 6. Re-run session hooks
+    Sum->>New: 7. Restore CLAUDE.md at system level
+    Sum->>New: 8. Continuation message
+    Note over New: "Continue without asking further questions"
+    New-->>New: Agent resumes mid-task
+```
+*The 8-step reconstruction sequence from Claude Code source. Summary alone isn't enough — the file re-reads, skill re-injection, and continuation message are what let the agent pick up work mid-task.*
 
 1. **Boundary marker** with pre-compaction metadata — token counts, turn counts, timestamp. This gives the model a clear signal that compaction occurred and when.
 2. **The formatted 9-section summary** from the summarization call.

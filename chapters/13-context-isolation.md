@@ -43,6 +43,29 @@ Concrete numbers make the savings tangible. Consider a parent agent doing a refa
 
 The parent's context dropped by ~83%. The sub-agents' contexts collectively used roughly the same total tokens as the inline approach (sometimes 15× more in production cases due to less efficient tool patterns), but the **parent's** window stays small. Since attention degradation is a function of window size for the agent currently making decisions, the savings translate to better quality, not just lower cost.
 
+```mermaid
+flowchart TB
+    subgraph Solo["Single-agent: everything inline"]
+        P1[Parent context]
+        P1 -->|50 tool calls| P1h["History: 80K tokens<br/>files, greps, errors, all inline"]
+    end
+
+    subgraph Multi["Multi-agent: delegated"]
+        P2[Parent context]
+        P2 -->|delegates| SA1[Sub-agent A<br/>fresh context<br/>10 calls]
+        P2 -->|delegates| SA2[Sub-agent B<br/>fresh context<br/>10 calls]
+        P2 -->|delegates| SA3[Sub-agent C<br/>fresh context<br/>10 calls]
+        SA1 -->|summary: ~500 tokens| P2h
+        SA2 -->|summary: ~500 tokens| P2h
+        SA3 -->|summary: ~500 tokens| P2h
+        P2h["Parent history:<br/>~15K tokens<br/>(5 summaries only)"]
+    end
+
+    style Solo fill:#fecaca
+    style Multi fill:#dcfce7
+```
+*Sub-agents as context-compression. Parent context grows by one summary per delegation, regardless of how much work the sub-agent did.*
+
 The trade is real: total token consumption usually goes up with delegation, sometimes substantially. What you buy is **per-agent window cleanliness**, which translates to better attention, fewer hallucinations, and the ability to scale to longer total tasks.
 
 ## 13.4 Sub-Agent Context Patterns
@@ -150,6 +173,38 @@ The convergence across systems: **structured returns, fresh contexts by default,
 ## 13.7 The Three-Layer Context Hierarchy for Multi-Agent Coding
 
 When multiple agents work on a shared codebase, naive isolation isn't enough. Each agent still needs to know enough shared invariants ("this project uses tabs, never spaces") to do its work coherently. The pattern that works in production: a three-layer context hierarchy where each layer is loaded selectively.
+
+```mermaid
+flowchart TB
+    subgraph Shared["Layer 1: Root context (20-50 lines)"]
+        R[Shared invariants]
+    end
+
+    subgraph Backend["Backend Engineer Agent"]
+        R1[Root] --> B[Backend role context]
+        B --> BP["Package: api/<br/>+ db/"]
+    end
+
+    subgraph Frontend["Frontend Engineer Agent"]
+        R2[Root] --> F[Frontend role context]
+        F --> FP["Package: ui/<br/>+ components/"]
+    end
+
+    subgraph Tests["Test Engineer Agent"]
+        R3[Root] --> T[Test role context]
+        T --> TP["Package: tests/"]
+    end
+
+    Shared -.loaded by all.-> R1
+    Shared -.loaded by all.-> R2
+    Shared -.loaded by all.-> R3
+
+    style Shared fill:#dbeafe
+    style Backend fill:#fef3c7
+    style Frontend fill:#dcfce7
+    style Tests fill:#fae8ff
+```
+*Three-layer context hierarchy. Each agent gets only its role and relevant package contexts — not the whole codebase's rules.*
 
 ### Layer 1: Root Context (20–50 lines)
 

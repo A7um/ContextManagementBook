@@ -29,6 +29,37 @@ The file system fixes all three. Big observations land on disk, with only a refe
 
 Manus's central contribution to context engineering vocabulary is the term **restorable compression**. The principle: every piece of context dropped from the window should leave behind a pointer that can re-materialize it.
 
+```mermaid
+flowchart LR
+    subgraph Before["Before: stuffing into context"]
+        W1[Web page content<br/>40K tokens]
+        F1[File content<br/>15K tokens]
+        T1[Tool output<br/>8K tokens]
+        CW[Context window<br/>overflowing]
+        W1 --> CW
+        F1 --> CW
+        T1 --> CW
+    end
+
+    subgraph After["After: restorable pointers"]
+        W2["URL: https://...<br/>~30 tokens"]
+        F2["Path: /src/x.ts<br/>~20 tokens"]
+        T2["File: /tmp/output.txt<br/>~25 tokens"]
+        CW2[Context window<br/>focused]
+        FS[(Files on disk<br/>full content)]
+        W2 --> CW2
+        F2 --> CW2
+        T2 --> CW2
+        W2 -.re-fetchable.-> FS
+        F2 -.re-readable.-> FS
+        T2 -.re-readable.-> FS
+    end
+
+    style Before fill:#fecaca
+    style After fill:#dcfce7
+```
+*Restorable compression. Large content leaves the context window but stays re-materializable via pointers. Nothing is permanently lost — only moved out of active attention.*
+
 This contrasts with standard compaction (Chapter 3), which replaces a region of the conversation with a summary. After standard compaction, the original tokens are unreachable — they were transformed in place. Restorable compression keeps the original tokens addressable on disk and replaces the in-window region with a reference.
 
 The pattern in production:
@@ -111,6 +142,29 @@ This is a context engineering pattern, not just an organizational one. The same 
 ## 11.5 Claude Code's Multi-Layer External Memory
 
 Analysis of the Claude Code v2.1.88 source bundle revealed a four-layer external memory architecture. Each layer has a different scope and persistence profile, and each is explicitly engineered to keep the active window small.
+
+```mermaid
+flowchart TB
+    subgraph Persistent["Persistent (disk)"]
+        L1["Layer 1: CLAUDE.md hierarchy<br/>/etc/, ~/.claude/, ./, ./src/"]
+        L2["Layer 2: Session memory<br/>~/.claude/projects/&lt;proj&gt;/memory/"]
+        L3["Layer 3: Tool output cache<br/>microcompacted to disk"]
+        L4["Layer 4: Working scratchpads<br/>PROGRESS.md, TODO.md"]
+    end
+
+    subgraph Context["Active context window"]
+        CW[Current conversation]
+    end
+
+    L1 -->|loaded every session| CW
+    L2 -->|read on demand| CW
+    L3 -->|re-read on demand| CW
+    L4 -->|read + write during session| CW
+
+    style Persistent fill:#e0e7ff
+    style Context fill:#fef3c7
+```
+*Four memory layers with different lifetimes and access patterns. Only Layer 1 auto-loads; Layers 2–4 are accessed on demand.*
 
 ### Layer 1: CLAUDE.md Hierarchy (Project Memory)
 

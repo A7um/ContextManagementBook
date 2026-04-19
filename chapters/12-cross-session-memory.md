@@ -11,6 +11,33 @@ Chapter 11 covered external memory within a session: files that hold tokens whic
 
 This is still a context engineering problem. The question is the same: what tokens enter the LLM's context window in the next session, and where do they come from? The answer for cross-session memory is: tokens that were committed to durable storage by previous sessions, and re-loaded at the start of the new one.
 
+```mermaid
+flowchart LR
+    subgraph S1["Session 1"]
+        S1c[Context window]
+        S1e["• Learn user prefers pnpm<br/>• Fix auth bug<br/>• Decide on JWT approach"]
+    end
+
+    subgraph S2["Session 2 (without memory)"]
+        S2c[Empty context]
+        S2e["• Tries npm first<br/>• Re-discovers auth bug<br/>• Re-debates JWT vs sessions"]
+    end
+
+    subgraph S3["Session 2 (with memory)"]
+        S3c[Context + loaded memory]
+        S3e["• Uses pnpm immediately<br/>• Knows about auth history<br/>• Continues from JWT decision"]
+    end
+
+    S1 -.context lost.-> S2
+    S1 -->|persist learnings| M[(Memory store)]
+    M -->|load at startup| S3
+
+    style S2 fill:#fecaca
+    style S3 fill:#dcfce7
+    style M fill:#e0e7ff
+```
+*Without cross-session memory, every session starts from zero. The remedy is explicit persistence of learnings, decisions, and preferences — loaded at the start of the next session.*
+
 ## 12.2 What Should and Shouldn't Cross Session Boundaries
 
 Not everything from the previous session should ride into the next one. Three categories of information cross well; three categories don't.
@@ -281,6 +308,34 @@ The protocol is what closes the loop. Without it, accumulated memory exists but 
 ## 12.8 LangGraph's Production Pattern: Checkpointer ≠ Store
 
 LangGraph is the most widely deployed Python framework for stateful LLM agents. The single most common architecture mistake people make in it: confusing the **checkpointer** with the **store**.
+
+```mermaid
+flowchart TB
+    subgraph Thread1["Thread: conversation-abc"]
+        T1msg[Messages<br/>checkpointer]
+    end
+    subgraph Thread2["Thread: conversation-xyz"]
+        T2msg[Messages<br/>checkpointer]
+    end
+    subgraph Thread3["Thread: conversation-pqr"]
+        T3msg[Messages<br/>checkpointer]
+    end
+
+    subgraph Store["Store (cross-thread)"]
+        Su["namespace: user:alice<br/>preferences, facts, profile"]
+        Sp["namespace: project:my-app<br/>architecture, conventions"]
+    end
+
+    T1msg -.reads.-> Su
+    T2msg -.reads.-> Su
+    T3msg -.reads.-> Sp
+
+    style Thread1 fill:#fef3c7
+    style Thread2 fill:#fef3c7
+    style Thread3 fill:#fef3c7
+    style Store fill:#dcfce7
+```
+*LangGraph's two-layer split. Checkpointer holds per-thread conversation state; Store holds cross-thread facts. Confusing them is the #1 architecture mistake in production.*
 
 ```python
 from langgraph.checkpoint.postgres import PostgresSaver

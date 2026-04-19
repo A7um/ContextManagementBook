@@ -23,6 +23,24 @@ Clearing is the preferred first response to context pressure. It is free (no LLM
 
 A second reason to prefer clearing: it preserves the cache-friendly layout from Chapter 7. When clearing happens via provider-level mechanisms (Anthropic's `cache_edits`, Claude Code's Path B below), it deletes content by reference without touching the bytes of the cached prefix. The next request still hits the cache. A naive client-side truncation that modifies the bytes of messages in the cached prefix would invalidate the cache from that point forward — a double cost.
 
+```mermaid
+flowchart LR
+    C["Full context<br/>200K tokens"]
+
+    C --> T["Truncation<br/>Drop oldest N"]
+    C --> CL["Clearing<br/>Remove specific items"]
+    C --> CMP["Compaction<br/>Summarize + continue"]
+
+    T --> T1["⚠️ Lossy<br/>⚡ Fast<br/>❌ Breaks coreference"]
+    CL --> CL1["✅ Precise<br/>⚡ Fast<br/>✅ Reversible<br/>❌ Limited to known targets"]
+    CMP --> CMP1["✅ Preserves gist<br/>🐢 Expensive (LLM call)<br/>❌ Irreversible<br/>✅ Handles any content"]
+
+    style T fill:#fecaca
+    style CL fill:#dcfce7
+    style CMP fill:#fef3c7
+```
+*Three options for making room. Clearing is the highest-ROI when targets are known (tool results, thinking blocks). Compaction is the fallback when everything matters. Truncation is a last resort.*
+
 ## 9.2 Anthropic's Server-Side Context Editing
 
 Anthropic exposes clearing through its `context-management-2025-06-27` beta header. Two clearing strategies are available:
@@ -225,6 +243,20 @@ Teams that don't use Anthropic's server-side editing need a client-side equivale
 Despite the name, MicroCompact is a **clearing** mechanism, not a compaction mechanism. It does not call an LLM. It does not produce a summary. It replaces old tool-result content with a short placeholder, which is exactly what `clear_tool_uses_20250919` does server-side.
 
 The interesting detail is that MicroCompact has **two execution paths** depending on cache state:
+
+```mermaid
+flowchart TD
+    Start[Tool result needs clearing] --> Q{Prompt cache<br/>warm?}
+    Q -->|Yes| P2["Path B: cache_edits API<br/>Delete by tool_use_id<br/>Cached prefix preserved"]
+    Q -->|No| P1["Path A: direct mutation<br/>Replace with placeholder:<br/>[Old tool result cleared]"]
+    P1 --> Done[Context reclaimed]
+    P2 --> Done
+
+    style P1 fill:#fef3c7
+    style P2 fill:#dcfce7
+    style Done fill:#dbeafe
+```
+*Claude Code's MicroCompact chooses its strategy based on cache state. Cache-aware deletion is the critical optimization — it reclaims context without invalidating the KV cache.*
 
 **Path A — cache cold (or non-Anthropic provider).** Directly mutates the message content in the conversation array. Older tool results are overwritten with `[Old tool result content cleared]` or a similar placeholder. This is the simple path: scan messages, replace content, done. It also invalidates any cached prefix that included the now-modified messages.
 
