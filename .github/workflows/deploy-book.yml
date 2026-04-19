@@ -35,6 +35,9 @@ jobs:
       - name: Build book
         run: mdbook build
 
+      - name: Optimize output (prefetch + service worker)
+        run: python3 scripts/optimize-book.py
+
       - name: Setup Pages
         uses: actions/configure-pages@v5
 
