@@ -1,0 +1,47 @@
+/* Slightly wider content area for dense tables and code */
+.content main {
+    max-width: 920px;
+}
+
+/* Tighter table rows */
+table td, table th {
+    padding: 6px 10px;
+}
+
+/* Better emphasis for blockquotes (aside callouts) */
+blockquote {
+    border-left: 4px solid var(--quote-border);
+    padding: 0.75em 1em;
+    margin: 1em 0;
+}
+
+/* Code blocks slightly larger line height for readability */
+pre code {
+    line-height: 1.5;
+}
+
+/* Mermaid diagrams: center and add breathing room */
+pre.mermaid, .mermaid {
+    text-align: center;
+    margin: 1.5em 0;
+}
+
+/* Footer tweaks */
+.content footer {
+    padding-top: 2em;
+    border-top: 1px solid var(--sidebar-bg);
+    color: var(--fg);
+    opacity: 0.7;
+    font-size: 0.9em;
+}
+
+/* Image captions styled in italic */
+.content main p em:only-child {
+    display: block;
+    text-align: center;
+    font-size: 0.9em;
+    color: var(--fg);
+    opacity: 0.75;
+    margin-top: -0.5em;
+    margin-bottom: 1.5em;
+}
