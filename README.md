@@ -1,65 +1,87 @@
-# Context Management for Long-Running LLM Agents
+# Context Engineering for Long-Running LLM Agents
 
-**How Production Agent Systems Actually Manage Context**
-
-*Grounded in source code, architecture decisions, and engineering blogs — not just papers.*
+**A Practitioner's Guide to Deciding What Enters the Model's Context Window**
 
 ---
 
-## About This Book
+## What This Book Is About
 
-Large language models have a fundamental constraint: a finite context window that serves as their only working memory. For agents that must run autonomously for hours—reading codebases, debugging complex systems, orchestrating multi-step workflows—this constraint is the primary engineering challenge. Not model capability. Not reasoning ability. Context.
+Context engineering is the discipline of deciding what tokens enter the LLM's context window at each step, in what structure, from which sources — to maximize outcome probability while respecting the finite attention budget.
 
-This is a **practitioner's guide** to context engineering — built primarily from how real products work, not from academic abstractions. Every pattern in this book is grounded in production systems: the Rust source code of OpenAI's Codex harness, the TypeScript compaction engine inside Claude Code, Cursor's Merkle-tree semantic index, Devin's managed agent architecture, Manus's logit-masking state machine, and Anthropic's brain-hand-session decomposition for Managed Agents. Where research papers inform the design, we cite them. But the primary sources are **engineering blogs, open-source repositories, reverse engineering, and published technical details** from the teams building these systems.
+This book covers **only** context engineering. It does not cover:
+- Prompt engineering (how to phrase a single instruction)
+- Harness engineering (sandboxes, permissions, tool execution, UI)
+- Agent orchestration plumbing (IPC, VM management, team protocols)
 
-This is the guide we wished existed when we started building long-running agents: concrete architecture decisions, exact threshold values, real code paths — not conceptual overviews.
+It covers what lives in the context window, how it gets there, how it's structured, how it shrinks when the window fills, and how it survives across context boundaries — the full lifecycle of context in a long-running agent.
 
-## Who This Book Is For
+## Who This Is For
 
-- **Agent system architects** designing long-running autonomous agents
-- **AI engineers** building production LLM applications that exceed single-turn interactions
-- **Technical leaders** evaluating context management strategies for their AI products
-- **Researchers** studying memory, retrieval, and reasoning in language model agents — with production grounding
+Engineers designing agents that run for hours or days. Teams building coding agents, research agents, customer-support agents, or any system where the agent must maintain coherence across many inference calls. Everything in this book is grounded in how real production systems at Anthropic, OpenAI, Cursor, Cognition (Devin), and Manus actually work.
 
-## Table of Contents
+## Structure
 
-| # | Chapter | Description |
-|---|---------|-------------|
-| 1 | [The Context Window as Working Memory](chapters/01-context-window-as-working-memory.md) | Why context is the binding constraint, what context rot is, and the foundational mental model |
-| 2 | [Anatomy of Agent Context](chapters/02-anatomy-of-agent-context.md) | The components that compete for the context window: system prompts, tools, history, and retrieval |
-| 3 | [Compaction: Summarizing Without Forgetting](chapters/03-compaction.md) | How OpenAI, Anthropic, and others implement server-side and client-side compaction |
-| 4 | [Context Editing and Selective Clearing](chapters/04-context-editing.md) | Tool result clearing, thinking block management, and surgical context pruning |
-| 5 | [Knowledge Base Design and Retrieval](chapters/05-knowledge-base-design.md) | RAG architecture, chunking, embedding, hybrid search, and agentic retrieval patterns |
-| 6 | [External Memory: The File System as Context](chapters/06-external-memory.md) | Using persistent storage as unbounded memory—lessons from Manus, Claude Code, and Codex |
-| 7 | [Multi-Agent Context Isolation](chapters/07-multi-agent-context-isolation.md) | Sub-agents, context quarantine, orchestration patterns, and the DACS framework |
-| 8 | [KV-Cache Optimization and Prompt Caching](chapters/08-kv-cache-and-prompt-caching.md) | Designing for cache efficiency: prefix stability, provider APIs, and cost reduction |
-| 9 | [Experience Accumulation Across Sessions](chapters/09-experience-accumulation.md) | Cross-session memory, persistent learning, and how agents avoid repeating work |
-| 10 | [Dynamic Context Discovery](chapters/10-dynamic-context-discovery.md) | Loading context on demand—Cursor's approach, Agent Skills, and progressive disclosure |
-| 11 | [Context Management in Production Systems](chapters/11-production-systems.md) | Deep dives into Codex, Claude Code, Cursor, Devin, and Manus architectures |
-| 12 | [The Model Context Protocol (MCP)](chapters/12-model-context-protocol.md) | Standardizing tool and resource integration across the agent ecosystem |
-| 13 | [Designing for the Future](chapters/13-designing-for-the-future.md) | Harness engineering, the evolution from prompts to systems, and what comes next |
+The book follows the lifecycle of context in an agent — from deciding what enters the window, through arranging and compressing it, to externalizing and preserving it across sessions.
 
-## Key Sources
+### Part I: Foundations
 
-### Engineering Blogs & Technical Posts
-- OpenAI, *Unrolling the Codex Agent Loop* (2026); *Harness Engineering* (2026)
-- Anthropic Engineering, *Effective Context Engineering for AI Agents* (2025)
-- Anthropic, *Harness Design for Long-Running Application Development* (2026); *Managed Agents* (2026)
-- Manus (Yichao Ji), *Context Engineering for AI Agents: Lessons from Building Manus* (2025)
-- Cursor Engineering, *Dynamic Context Discovery* (2025)
-- Cognition (Devin), *How We Build Devin* (2025–2026)
+- **[Ch 1: What Context Engineering Is](chapters/01-what-context-engineering-is.md)** — Definition, scope, and boundaries. The nested hierarchy of prompt ⊂ context ⊂ harness engineering.
+- **[Ch 2: The Attention Budget](chapters/02-the-attention-budget.md)** — Context rot as a production phenomenon. The economics of tokens. Why bigger windows don't fix it.
+- **[Ch 3: Anatomy of a Context Window](chapters/03-anatomy-of-context.md)** — The four categories of context. Real token budgets from Claude Code source. Counting strategies.
 
-### Source Code & Repositories
-- [`openai/codex`](https://github.com/openai/codex) — Rust agent harness (`codex-rs/core`), open source
-- Claude Code — compaction engine (`compact.ts`, `autoCompact.ts`, `microCompact.ts`), hooks system
-- Cursor — `.cursor/rules/` MDC format, semantic index architecture
-- Devin — MCP server interface, DeepWiki, playbook system
+### Part II: Selection — What belongs in the window
 
-### Research Papers
-- Chroma Research, *Context Rot: How Increasing Input Tokens Impacts LLM Performance* (2025)
-- arXiv: *Memory for Autonomous LLM Agents* (2026), *ExpRAG* (2026), *DACS* (2026)
-- Barazany, *Claude Code Source Analysis: Compaction Engine Internals* (2026)
+- **[Ch 4: Static Context](chapters/04-static-context.md)** — System prompts, project memory files (CLAUDE.md, .cursor/rules, AGENTS.md). The Goldilocks altitude.
+- **[Ch 5: Tool Definitions](chapters/05-tool-definitions.md)** — The hidden token tax. Anthropic tool search (`defer_loading`), Cursor's file-based tools, Manus logit masking, Anthropic code mode.
+- **[Ch 6: Retrieval](chapters/06-retrieval.md)** — Pulling context in just in time. Cursor's Merkle-tree index, Devin's DeepWiki, OpenClaw's QMD. When long context isn't enough.
 
----
+### Part III: Structure — How to arrange it
 
-*This book is a living document. Context engineering is an emerging discipline evolving with every model release, every new production system, and every harness rewrite. Built from how products actually work. Contributions, corrections, and updates are welcome.*
+- **[Ch 7: Structuring for the Cache](chapters/07-structuring-for-cache.md)** — KV-cache economics. Stable-prefix-first layout. Provider APIs (Anthropic/OpenAI/Gemini). Manus's three rules.
+- **[Ch 8: Structuring for Attention](chapters/08-structuring-for-attention.md)** — Primacy and recency. Manus's `todo.md` recitation. The hot-tail pattern. Structured sections.
+
+### Part IV: Compression — When the window fills
+
+- **[Ch 9: Clearing](chapters/09-clearing.md)** — Surgical removal without summarization. Anthropic's `clear_tool_uses` / `clear_thinking`. Claude Code's MicroCompact (two paths). Priority retention.
+- **[Ch 10: Compaction](chapters/10-compaction.md)** — Summarization with state preservation. Claude Code's 4-tier system from source leak. OpenAI Codex compaction. The 9-section format. Post-compaction reconstruction.
+
+### Part V: Externalization — Context beyond the window
+
+- **[Ch 11: External Memory](chapters/11-external-memory.md)** — The file system as extended context. Manus's restorable compression. Claude Code's memory layers. Anthropic's memory tool. Scratchpads.
+- **[Ch 12: Cross-Session Memory](chapters/12-cross-session-memory.md)** — Context that outlives the conversation. Devin's Knowledge + Playbooks. Claude Code's AutoDream. LangGraph checkpointer vs store. The Brain-Made-of-Markdown pattern.
+
+### Part VI: Isolation — Context per agent
+
+- **[Ch 13: Context Isolation](chapters/13-context-isolation.md)** — Sub-agents as context-compression technique. Fresh vs forked windows. Return format design. The three-layer context hierarchy.
+
+### Part VII: Practice
+
+- **[Ch 14: Measurement and Iteration](chapters/14-measurement.md)** — The metrics that matter. Diagnosing context problems. A/B testing. Production improvements ranked by impact.
+
+## Primary Sources
+
+This book is grounded in industrial implementation, not academic research.
+
+**Engineering blogs:**
+- Anthropic: *Effective Context Engineering for AI Agents*, *Harness Design for Long-Running Apps*, *Context Editing and Memory Tool*
+- OpenAI: *Unrolling the Codex Agent Loop*, *Harness Engineering*
+- Manus: *Context Engineering for AI Agents: Lessons from Building Manus*
+- Cursor: *Dynamic Context Discovery*, *Securely Indexing Large Codebases*
+- Cognition: *Rebuilding Devin for Claude Sonnet 4.5*, *How Cognition Uses Devin to Build Devin*
+
+**Source code analyses:**
+- Claude Code v2.1.88 source leak (512K lines TypeScript, 1,906 files) — reverse-engineered analyses covering `compact.ts`, `autoCompact.ts`, `microCompact.ts`, `sessionMemoryCompact.ts`, `QueryEngine.ts`
+- OpenAI Codex source code (`codex-rs`, publicly available)
+- Anthropic SDK source (`anthropic-sdk-python`, `anthropic-sdk-typescript`)
+- LangGraph memory implementation (`checkpointer`, `store`)
+
+## A Note on Scope
+
+Context engineering is a narrower discipline than people often assume. It does not encompass all the challenges of building LLM agents. If you're looking for a book on:
+
+- **Tool execution, sandboxing, permissions** → see harness engineering
+- **Multi-agent orchestration patterns** → see agent frameworks (LangGraph, Claude Agent SDK, OpenAI Agents SDK)
+- **Agent UI/UX** → see Claude Code's Ink-based terminal UI or Cursor's IDE integration
+- **Model selection and fine-tuning** → see the model providers' documentation
+
+This book covers only the layer between those concerns: **what goes into the context window, and why**.
