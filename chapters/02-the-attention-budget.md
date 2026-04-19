@@ -36,21 +36,14 @@ There is one more piece of background that practitioners need to know about, eve
 
 Empirically, attention is highest at the very beginning of the context (where the system prompt sits) and at the very end (where the most recent user message and tool results sit). The middle — wherever the bulk of the conversation history accumulates — gets less attention. This is the "lost in the middle" effect.
 
+```mermaid
+xychart-beta
+    title "Attention recall across context position (U-shape)"
+    x-axis "Position in context" ["Start", "25%", "50%", "75%", "End"]
+    y-axis "Recall accuracy %" 40 --> 100
+    line [95, 72, 58, 74, 92]
 ```
-┌──────────────────────────────────────────────────────────┐
-│                  ATTENTION ACROSS THE WINDOW              │
-│                                                           │
-│   ████                                            ████   │
-│   ████      primacy                  recency      ████   │
-│   ████   ◀──────                      ──────▶     ████   │
-│                                                           │
-│              ░░░░░░░░░░░░░░░░░░░░░░░░░                   │
-│              ░░░    "lost in the middle"   ░░            │
-│                                                           │
-│   start         conversation history grows      end       │
-│  (system)             (the dilution zone)    (recent)    │
-└──────────────────────────────────────────────────────────┘
-```
+*Recall follows a U-shape. Information at the beginning and end gets more attention than the middle — a production constant practitioners plan around.*
 
 For the practitioner, three implications matter:
 
@@ -79,6 +72,27 @@ The production discipline is a re-orientation: the question stops being "what *c
 ## 2.4 The Three Failure Modes
 
 Watching production agents misbehave, three distinct failure modes recur. They have different root causes and different fixes, and being able to distinguish them is most of the diagnostic skill.
+
+```mermaid
+flowchart TD
+    A[Long session] --> B[History grows]
+    B --> C1[Token budget pressure]
+    B --> C2[Attention dilution]
+    B --> C3[Context pollution]
+
+    C1 --> D1["Hits window limit<br/>or triggers compaction"]
+    C2 --> D2["Stale content competes<br/>with current task"]
+    C3 --> D3["Subtask A's residue<br/>interferes with subtask B"]
+
+    D1 --> E[Quality / cost degrades]
+    D2 --> E
+    D3 --> E
+
+    style C1 fill:#fecaca
+    style C2 fill:#fed7aa
+    style C3 fill:#fde68a
+```
+*Three compounding failure modes. All trace back to the same root — unbounded context growth — but each needs a different remedy.*
 
 ### Failure mode 1: Token budget pressure
 

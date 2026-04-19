@@ -94,6 +94,28 @@ Production retrieval is agentic: the agent calls retrieval when it needs to, sha
 
 Every retrieval system embeds a set of decisions. Making these explicit is most of the design work.
 
+```mermaid
+flowchart TD
+    Q[User query or agent step] --> D1{Query complexity?}
+    D1 -->|Simple / factual| Z1[Direct LLM, no retrieval]
+    D1 -->|Needs external data| D2{Knowledge source type?}
+    D2 -->|Codebase| R1[Semantic + keyword<br/>over repo index]
+    D2 -->|Documents| R2[Vector search<br/>+ metadata filter]
+    D2 -->|Multiple sources| R3[Route to appropriate source]
+    R1 --> RR[Retrieve top 20]
+    R2 --> RR
+    R3 --> RR
+    RR --> RK[Rerank → keep top 3-5]
+    RK --> C{Grade relevance?}
+    C -->|Relevant| INJ[Inject into context]
+    C -->|Irrelevant| RQ[Rewrite query or fall through]
+    RQ --> RR
+
+    style Z1 fill:#dcfce7
+    style INJ fill:#dcfce7
+```
+*A retrieval decision flow. Most production systems skip retrieval entirely for simple queries, rerank after an initial wide net, and include a relevance grading step.*
+
 ### When to retrieve
 
 Three patterns, from heaviest to lightest:

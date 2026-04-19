@@ -28,6 +28,24 @@ The rule is mechanical. Caching works on prefixes. A prefix is a contiguous run 
 
 This forces an unambiguous layout:
 
+```mermaid
+flowchart LR
+    subgraph Layout["Cache-optimal context layout"]
+        direction LR
+        A["System prompt<br/>🔒 stable<br/>1h cache"] --> B["Tool definitions<br/>🔒 stable<br/>1h cache"]
+        B --> C["Session summary<br/>🔄 slow-changing<br/>5min cache"]
+        C --> D["Conversation history<br/>📈 growing<br/>no cache"]
+        D --> E["Current input<br/>⚡ dynamic<br/>never cached"]
+    end
+
+    style A fill:#dbeafe
+    style B fill:#dbeafe
+    style C fill:#fef3c7
+    style D fill:#fed7aa
+    style E fill:#fecaca
+```
+*Stability decreases left-to-right. Anything before a changed token invalidates the cache from that point onward — so order by stability.*
+
 ```
 ┌───────────────────────────────────────────────────────────────┐
 │                  CACHE-OPTIMIZED PROMPT LAYOUT                 │
@@ -55,6 +73,30 @@ Violations are common and expensive. A timestamp in the system prompt nukes the 
 ## 7.3 The Hierarchical Context Architecture for 24/7 Agents
 
 For agents that run continuously — customer support, coding copilots, research assistants — a three-tier architecture is the durable pattern:
+
+```mermaid
+flowchart TB
+    subgraph A["Layer A — Immutable (1h cache)"]
+        a1[System prompt]
+        a2[Tool definitions]
+    end
+    subgraph B["Layer B — Slow-changing (5min cache)"]
+        b1[User profile]
+        b2[Session summary]
+    end
+    subgraph C["Layer C — Growing (uncached)"]
+        c1[Recent turns]
+        c2[Current input]
+    end
+
+    A --> B
+    B --> C
+
+    style A fill:#dbeafe,stroke:#2563eb
+    style B fill:#fef3c7,stroke:#ca8a04
+    style C fill:#fecaca,stroke:#dc2626
+```
+*Three cache-lifetime layers. Layer A amortizes across the entire session; Layer B across turns; Layer C is per-request. Target 70–80% hit rate on A+B combined.*
 
 ```
 Layer A: Immutable (1h cache)      system prompt, tool definitions
@@ -277,6 +319,30 @@ Compaction is covered in detail in Chapter 10. This section is narrow: how does 
 The Claude Code source leak (v2.1.88) exposed the answer. When Claude Code performs a full summarization pass, the summarization call **reuses the exact same system prompt, tools, and model as the main conversation.** The compaction instruction is appended as a new user message at the tail of the message list — it does not replace or modify the prefix.
 
 The experimental justification is in the leaked notes: using a different system prompt for summarization produced a **98% cache miss rate**. With a 30–40K-token system prompt, that miss is a significant expense paid on every compaction. The fix is mechanical — the compaction call piggybacks on the main conversation's cached prefix, so the summarization model reads the full history as a cache hit and generates only the summary as new tokens.
+
+```mermaid
+sequenceDiagram
+    participant Agent
+    participant API as Anthropic API
+    participant Cache as KV Cache
+
+    Note over Cache: Main conversation builds up cache hit
+    Agent->>API: Request with stable prefix + history
+    API-->>Cache: Check prefix match
+    Cache-->>API: ✅ Cache hit on 150K tokens
+    API-->>Agent: Response
+
+    Note over Agent: Compaction triggered
+    Agent->>API: Compaction request (SAME system prompt, SAME tools)
+    API-->>Cache: Check prefix match
+    Cache-->>API: ✅ Cache hit preserved
+    API-->>Agent: Summarized context
+
+    Note over Agent: Different prompt would cause:
+    Agent--xAPI: ❌ Compaction with different system prompt
+    API--xCache: Cache miss — 98% of tokens re-processed
+```
+*Claude Code's cache-aware compaction. Reusing the exact same system prompt, tools, and model preserves the cache. A different system prompt causes a 98% miss rate.*
 
 The same discipline applies when you implement your own compaction:
 

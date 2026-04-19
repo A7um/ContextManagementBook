@@ -71,6 +71,26 @@ The boundaries are sharp, and this book is about the middle ring only. We will n
 
 A useful test: if changing your decision changes which tokens the model sees, it is context engineering. If it changes how those tokens are produced or what happens after the model emits its output, it is harness engineering.
 
+```mermaid
+flowchart TB
+    subgraph H["Harness Engineering"]
+        direction TB
+        subgraph C["Context Engineering"]
+            direction TB
+            subgraph P["Prompt Engineering"]
+                p1["How do I phrase<br/>this instruction?"]
+            end
+            c1["What tokens enter<br/>the context window?"]
+        end
+        h1["How does the runtime<br/>execute tools & maintain state?"]
+    end
+
+    style H fill:#fef3c7,stroke:#ca8a04
+    style C fill:#dbeafe,stroke:#2563eb
+    style P fill:#dcfce7,stroke:#16a34a
+```
+*The three disciplines as nested concerns. This book covers only the middle layer.*
+
 ## 1.3 Why the Middle Layer Is the Hard Problem
 
 You can build a working chatbot without thinking about context engineering. The conversation is short, the tool calls are few, the window is never close to full. Single-turn or low-turn applications can be served well by careful prompt engineering and a decent base model.
@@ -106,6 +126,23 @@ Strip the discipline down to its operational verbs and a small set of activities
 **Measurement** — is it working? Token utilization, cache hit rate, time-to-first-token, pass rates per task type. A context strategy that cannot be measured cannot be improved. Manus reports that KV-cache hit rate is the single most important metric for a production agent; teams that don't track it are flying blind.
 
 These seven activities are not a sequence — they happen continuously and in parallel. They are also not independent: a decision to externalize a tool output (rather than keep it in conversation) makes future retrieval necessary; a choice of structure determines what can be cached; a measurement that hit rate has dropped triggers a re-examination of selection criteria.
+
+```mermaid
+flowchart LR
+    S[Selection] --> St[Structure]
+    St --> Cm[Compression]
+    Cm --> Ex[Externalization]
+    Ex --> R[Retrieval]
+    R --> S
+    Pr[Preservation] -.crosses.-> S
+    M[Measurement] -.observes.-> S
+    M -.observes.-> Cm
+    M -.observes.-> R
+
+    style M fill:#fee2e2
+    style Pr fill:#e0e7ff
+```
+*The context engineering lifecycle. Selection, structure, compression, externalization, and retrieval form the main loop. Preservation spans sessions; measurement observes the whole system.*
 
 ## 1.5 How the Rest of This Book Is Organized
 

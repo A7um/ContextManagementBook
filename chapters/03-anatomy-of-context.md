@@ -10,6 +10,19 @@ The answer turns out to have remarkable structure. Across Claude Code, OpenAI Co
 
 Here is an actual breakdown from a Claude Code session at approximately turn 40, derived from inspecting the Messages API request payload (the values come from the leaked Claude Code v2.1.88 source analysis and are typical, not pathological):
 
+```mermaid
+pie showData
+    title "Claude Code 200K session breakdown"
+    "Conversation history" : 80000
+    "Tool outputs" : 50000
+    "Headroom / reserve" : 35000
+    "Tool definitions" : 25000
+    "Model output (turn)" : 5000
+    "System prompt" : 3000
+    "CLAUDE.md" : 2000
+```
+*A real 200K context window fills with conversation history and tool outputs first. Static content (prompt, tools, CLAUDE.md) is a minority.*
+
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │                    200,000 TOKEN CONTEXT WINDOW                  │
@@ -47,6 +60,22 @@ Second, 17.5% of the window is *deliberately empty*. The headroom is not free sp
 ## 3.2 The Four Categories of Context
 
 The seven specific line items in the breakdown above — system prompt, CLAUDE.md, tool definitions, conversation history, tool outputs, current model output, headroom — collapse into four categories with genuinely different properties. Treating them as the same kind of thing is the most common mistake in early context engineering.
+
+```mermaid
+quadrantChart
+    title Four categories of context
+    x-axis Low compressibility --> High compressibility
+    y-axis Engineer-controlled --> Emergent
+    quadrant-1 Compressible & emergent
+    quadrant-2 Resistant & emergent
+    quadrant-3 Resistant & controlled
+    quadrant-4 Compressible & controlled
+    "Static context": [0.2, 0.15]
+    "Model output": [0.4, 0.85]
+    "Conversation history": [0.7, 0.75]
+    "Tool outputs": [0.9, 0.6]
+```
+*Context engineering leverage is highest in the upper-right (emergent, highly compressible) — but you can only shape it indirectly.*
 
 ### Static context
 
