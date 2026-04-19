@@ -199,7 +199,10 @@ def generate_service_worker(book_root: Path, pages: list[Path]) -> None:
         "mark.min.js",
         # Book-specific assets
         "theme/custom.css",
+        "theme/mermaid.min.js",
         "theme/mermaid-init.js",
+        "theme/book-zoom.css",
+        "theme/book-zoom.js",
     ]
     for extra in extras:
         if (book_root / extra).exists():
