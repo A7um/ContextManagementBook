@@ -1,0 +1,32 @@
+.lang-switcher {
+    display: flex;
+    align-items: center;
+    gap: 2px;
+    margin-left: 12px;
+    font-size: 0.85em;
+    background: var(--sidebar-bg);
+    border-radius: 4px;
+    padding: 2px;
+    border: 1px solid var(--sidebar-bg);
+}
+
+.lang-switcher a {
+    text-decoration: none;
+    color: var(--sidebar-fg);
+    padding: 3px 8px;
+    border-radius: 3px;
+    transition: background-color 0.2s, color 0.2s;
+    font-weight: 500;
+    line-height: 1;
+}
+
+.lang-switcher a:hover {
+    background: var(--sidebar-active);
+    color: var(--sidebar-fg);
+}
+
+.lang-switcher a.active {
+    background: var(--sidebar-active);
+    color: var(--sidebar-fg);
+    font-weight: 700;
+}
