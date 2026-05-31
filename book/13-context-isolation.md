@@ -170,7 +170,139 @@ Each major production system implements sub-agent isolation slightly differently
 
 The convergence across systems: **structured returns, fresh contexts by default, an explicit short return format**. Different mechanisms, same context engineering goals.
 
-## 13.7 The Three-Layer Context Hierarchy for Multi-Agent Coding
+## 13.7 Anthropic's Multi-Agent Research System — Isolation at Scale
+
+In June 2025, Anthropic published "How we built our multi-agent research system" describing the architecture behind their Research feature. The system is a textbook case of context isolation delivering measurable gains — and a cautionary tale about when multi-agent economics are justified.
+
+**Architecture.** A Lead Researcher agent (Claude Opus 4) coordinates multiple Subagents (Claude Sonnet 4) that run in parallel with independent context windows. The Lead Researcher decomposes a research question into subtasks, spawns 3–5 subagents simultaneously, and synthesizes their findings into a final report.
+
+**Result: 90.2% improvement** over single-agent Claude Opus 4 on Anthropic's internal research eval. That number is striking — it's not a marginal gain from better prompting, it's a near-doubling in quality from an architectural decision about context.
+
+**The key finding.** Anthropic's analysis revealed that "token usage by itself explains 80% of the performance variance." Multi-agent systems work primarily because they let you **spend enough tokens on the problem** by distributing work across isolated windows. A single agent hitting its context ceiling can't do more work; multiple agents with fresh windows can.
+
+**The economics are brutal.** The multi-agent research system uses ~15× more tokens than a chat response and ~4× more than a single-agent approach. This is only justified for high-value tasks where quality matters more than cost — deep research queries, not quick lookups.
+
+### Critical Architectural Decisions (Context Perspective)
+
+Every major design choice maps to a context engineering principle:
+
+**Self-contained delegation units.** Each subagent gets a complete task description + output format + fresh context window. The subagent knows nothing about the broader research question beyond what's in its delegation prompt. No shared history, no inherited context, no ambient knowledge.
+
+**No inter-subagent awareness.** Subagents don't know other subagents exist. They can't coordinate mid-task or read each other's outputs. This isn't a limitation — it's isolation by design. Cross-subagent coordination would require shared context, which would defeat the purpose.
+
+**Plan-to-memory before spawning.** The Lead Researcher saves its research plan to a persistent memory tool before spawning subagents. Why? Because the Lead's own context may be truncated by the time subagents return (long-running sessions hit window limits). The plan lives outside any single context window — restorable compression applied to the coordinator itself.
+
+**Filesystem as return channel.** Subagents write their output to filesystem rather than passing large results through the coordinator. Anthropic's framing: "minimize the game of telephone." This is the artifact-reference return pattern from section 13.5 — the coordinator's context absorbs a file path, not 10K tokens of findings.
+
+**CitationAgent as a separate verification pass.** A dedicated agent with its own fresh context reads the assembled report and verifies citations. This works because citation verification is genuinely independent work — it doesn't need the research context, only the claims and their sources.
+
+### Parallelization Economics
+
+The Lead Researcher spawns 3–5 subagents simultaneously; each subagent itself uses 3+ tools in parallel. This two-level parallelism cuts research time by up to 90% for complex queries compared to sequential execution.
+
+From a context engineering perspective, parallelism and isolation are complementary: you can only parallelize safely when each worker has an independent context window. Shared-context parallel agents would create race conditions in attention — one agent's file read polluting another agent's reasoning.
+
+### When This Pattern Applies
+
+| Works well | Doesn't work |
+|---|---|
+| Breadth-first tasks (research many sources) | Tasks needing shared context across workers |
+| Heavy parallelization potential | Tight sequential dependencies (most coding) |
+| Information volume exceeds a single window | Real-time coordination between workers |
+| Many independent tool calls | Tasks where synthesis is harder than gathering |
+
+The critical observation: Anthropic found this architecture works for **research** but explicitly notes it struggles with tasks requiring tight coordination — which includes most coding tasks. Context isolation shines when subtasks are genuinely independent at the information level.
+
+## 13.8 Subagent-Driven Development — The Superpowers Pattern
+
+The Superpowers project (github.com/obra/superpowers, 200K+ stars) formalized subagent isolation not as an occasional optimization but as a **complete development methodology**. Where Anthropic's research system isolates for breadth, Superpowers isolates for quality — using fresh-context subagents as the primary unit of all implementation work.
+
+### The Core Loop
+
+```
+Coordinator: plan tasks → for each task:
+  1. Spawn fresh subagent with precisely crafted instructions
+  2. Subagent implements (fresh context, no inherited history)
+  3. First review pass: spec compliance (did it do what was asked?)
+  4. Second review pass: code quality (is the implementation good?)
+  5. If passes both → mark DONE → next task
+  6. If fails → re-delegate with feedback
+```
+
+The coordinator never sees raw implementation details. It maintains a clean context of task descriptions + completion statuses + review summaries. The messy work — reading files, running tests, debugging — happens in disposable subagent windows.
+
+### Why It Works (Context Engineering Perspective)
+
+The methodology's core insight, stated directly in its documentation:
+
+> "Fresh subagent per task + two-stage review = high quality, fast iteration"
+
+> "Subagents should never inherit your session's context or history — you construct exactly what they need"
+
+This is the fresh-context pattern from section 13.4, elevated to a development principle. The coordinator doesn't delegate because it's running out of context — it delegates because fresh-context execution produces better results than continued-context execution, regardless of window pressure.
+
+**The coordinator's context stays strategic.** It holds the project plan, task dependencies, completion status, and review summaries. It never accumulates file contents, test outputs, or debugging traces. A coordinator that has delegated 20 implementation tasks still has a clean window — 20 task descriptions + 20 status summaries ≈ 4K tokens of coordination overhead.
+
+### The Four-Status Return Contract
+
+Subagents return one of four statuses:
+
+| Status | Meaning | Coordinator action |
+|---|---|---|
+| `DONE` | Task completed successfully | Move to review |
+| `DONE_WITH_CONCERNS` | Completed but flagged issues | Review with extra scrutiny |
+| `NEEDS_CONTEXT` | Missing information to proceed | Coordinator provides context, re-delegates |
+| `BLOCKED` | Cannot proceed (dependency, ambiguity) | Coordinator resolves blocker |
+
+This is a return-format contract (section 13.5) at its most disciplined. The coordinator doesn't parse free-text descriptions of what happened — it reads a status enum and acts accordingly. The status drives the control flow; the optional details are secondary.
+
+### Model Selection as Context Optimization
+
+Superpowers treats model choice as part of context engineering. Not all subagents need the most capable (and expensive) model:
+
+- **Mechanical tasks** (rename variable, add import, run formatter): fastest/cheapest model. The context is simple, the task is well-specified, and reasoning depth doesn't matter.
+- **Standard implementation** (implement a function to spec): mid-tier model. Needs enough reasoning to handle edge cases but doesn't need architectural judgment.
+- **Architecture and review**: most capable model. Needs to reason about trade-offs, spot subtle issues, and make judgment calls.
+
+This isn't just cost optimization — it's context efficiency. Cheaper models respond faster, which means the coordinator gets results back sooner and can proceed with its planning. The coordinator's context doesn't grow while waiting.
+
+### Two-Stage Review: Order Matters
+
+The review sequence is deliberate:
+
+1. **Spec compliance first.** Does the implementation match what was asked? This catches scope creep, missing requirements, and misunderstandings before anyone evaluates code quality.
+2. **Code quality second.** Is the implementation well-written? This catches style issues, performance problems, and maintainability concerns.
+
+The ordering is a context engineering decision. If code quality review came first, a reviewer might approve beautiful code that doesn't meet the spec — wasting the parent's context on a false positive. Spec compliance is cheaper to check and eliminates a larger class of failures.
+
+### Connection to Anthropic's Pattern
+
+Both systems converge on the same core principles despite different domains:
+
+| Principle | Anthropic Research | Superpowers |
+|---|---|---|
+| Delegation unit | Self-contained task description | Precisely crafted implementation spec |
+| Subagent context | Fresh window, no inherited history | Fresh window, no inherited history |
+| Return channel | Filesystem (artifact reference) | Status enum + artifacts on disk |
+| Coordinator context | Research plan + synthesis | Task plan + review summaries |
+| Parallelism | 3–5 subagents simultaneously | Sequential (dependencies between tasks) |
+| Primary benefit | Breadth (cover more ground) | Quality (fresh attention per task) |
+
+The shared insight: **the coordinator's job is context curation, not execution**. It decides what goes into each subagent's window, and it absorbs only summaries back. The execution happens elsewhere.
+
+### Single-Agent vs. Subagent-Driven: Context Growth
+
+| Metric | Single agent (30 tasks) | Subagent-driven (30 tasks) |
+|---|---|---|
+| Coordinator context at task 30 | ~150K tokens (all accumulated) | ~12K tokens (plan + 30 summaries) |
+| Attention quality at task 30 | Degraded (window pollution) | Fresh (clean coordinator window) |
+| Per-task execution context | Inherited from all previous tasks | Fresh per task (~5-15K) |
+| Total tokens consumed | Lower (no delegation overhead) | Higher (~2-4× more total) |
+| Quality at task 30 vs. task 1 | Noticeably worse | Comparable |
+
+The trade-off is consistent with section 13.3: you spend more total tokens to keep per-agent windows clean. The Superpowers methodology bets that for multi-task development sessions, the quality-at-task-30 improvement justifies the token overhead.
+
+## 13.9 The Three-Layer Context Hierarchy for Multi-Agent Coding
 
 When multiple agents work on a shared codebase, naive isolation isn't enough. Each agent still needs to know enough shared invariants ("this project uses tabs, never spaces") to do its work coherently. The pattern that works in production: a three-layer context hierarchy where each layer is loaded selectively.
 
@@ -258,7 +390,7 @@ Each agent's instruction context is tailored. Zero cross-domain pollution. The b
 
 This pattern composes naturally with sub-agent delegation. A parent backend agent that delegates a sub-agent to investigate a specific service loads the appropriate Layer 3 context for that service in the sub-agent's prompt — keeping the sub-agent specialized and its window small.
 
-## 13.8 Anti-Patterns
+## 13.10 Anti-Patterns
 
 Four context engineering anti-patterns recur across teams that try sub-agents and find them not delivering the expected gains.
 
@@ -270,7 +402,7 @@ Four context engineering anti-patterns recur across teams that try sub-agents an
 
 **Eager delegation.** Spawning a sub-agent before knowing whether the work is needed. The classic case: the parent thinks "I should investigate X" and spawns a sub-agent without first checking whether X is even relevant. The sub-agent does the work, returns a result, and the parent realizes the investigation was beside the point. Lazy alternative: do the cheap precheck inline first; only delegate when the work is confirmed necessary and substantial.
 
-## 13.9 When NOT to Use Sub-Agents
+## 13.11 When NOT to Use Sub-Agents
 
 Multi-agent isolation is a tool, not a default. Four situations where it's the wrong choice.
 
@@ -284,7 +416,7 @@ Multi-agent isolation is a tool, not a default. Four situations where it's the w
 
 The condition that justifies isolation is **window pressure**. If the parent's window would otherwise grow past the point where attention degrades, isolation pays off. If it wouldn't, isolation is overhead.
 
-## 13.10 Key Takeaways
+## 13.12 Key Takeaways
 
 1. **Sub-agents are context compression.** The parent's window grows by one turn per delegation, regardless of how many turns the sub-agent ran internally. That compression ratio is the entire reason to delegate.
 
@@ -296,8 +428,12 @@ The condition that justifies isolation is **window pressure**. If the parent's w
 
 5. **Return format is a contract.** Text summary, structured JSON, or artifact reference. Pick one, enforce it. Verbose returns silently undo delegation.
 
-6. **The three-layer context hierarchy.** Root invariants (20–50 lines, shared) + role context (100–200 lines, per agent) + package context (50–150 lines, per domain). Each agent's window is tailored to its job.
+6. **Token usage explains 80% of multi-agent performance variance.** Anthropic's research system demonstrates that isolation works primarily by letting you spend more tokens on the problem across parallel fresh windows — not through better prompting or coordination.
 
-7. **Anti-patterns: over-delegation, under-isolation, verbose returns, eager delegation.** Sub-agents that cost more context than they save are common; usually one of these four is why.
+7. **Subagent-driven development: fresh context per task + two-stage review.** The Superpowers pattern shows that systematic isolation (every implementation task in a fresh window) keeps coordinator context at ~12K tokens even after 30 delegated tasks, while single-agent context would reach ~150K.
 
-8. **Reach for sub-agents when window pressure is real.** Long tasks, large inspections, multi-domain work. For simple linear tasks, sequential dependencies, shared mutable state, or short contexts, a single agent is simpler, faster, and cheaper.
+8. **The three-layer context hierarchy.** Root invariants (20–50 lines, shared) + role context (100–200 lines, per agent) + package context (50–150 lines, per domain). Each agent's window is tailored to its job.
+
+9. **Anti-patterns: over-delegation, under-isolation, verbose returns, eager delegation.** Sub-agents that cost more context than they save are common; usually one of these four is why.
+
+10. **Reach for sub-agents when window pressure is real.** Long tasks, large inspections, multi-domain work. For simple linear tasks, sequential dependencies, shared mutable state, or short contexts, a single agent is simpler, faster, and cheaper.
