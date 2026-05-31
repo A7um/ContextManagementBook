@@ -33,6 +33,8 @@ There are dozens of metrics you could collect. A small handful actually drive de
 
 **Tool selection accuracy.** For agents with many tools (>20), measure precision and recall of tool selection. Did the model pick the right tool? Did it pick the wrong one when a right one was available? Bad tool selection often points to context confusion — too many tools loaded, ambiguous descriptions, or competing instructions.
 
+**Token-to-performance correlation.** Anthropic's multi-agent research evaluation revealed a striking finding: token usage alone explains 80% of the performance variance, with tool call count and model choice as secondary factors. This validates the core argument of this book — tokens are the fundamental resource. Multi-agent systems work primarily because they spend more tokens by distributing work across isolated windows. The implication: when measuring agent performance, track total tokens spent (including subagent tokens) as a primary predictor of quality, not just a cost metric.
+
 ## 14.3 A `ContextMetrics` Implementation
 
 A reference Python implementation that captures all of the above. The point is to make instrumentation cheap so it actually gets added.
@@ -170,6 +172,8 @@ flowchart TD
 
 **Tool selection accuracy dropping → too many tools.** When the model has 50 tools loaded and uses 2 of them per turn, it's spending attention budget on tool descriptions instead of task reasoning. Implement tool search (Anthropic's `defer_loading`) or tool routing so only relevant tools enter the window.
 
+**Multi-agent system underperforming → insufficient token budget.** If you've moved to a multi-agent architecture and quality hasn't improved as expected, check total token spend. Multi-agent systems use ~15x more tokens than single-agent chat. If budget constraints are artificially limiting subagent depth (fewer tool calls, shorter explorations), the isolation benefit is negated by insufficient investigation. The fix: either increase token budget or restrict multi-agent to high-value tasks where the 15x cost is justified.
+
 ## 14.5 A/B Testing Context Changes
 
 Cursor's engineering blog on dynamic context discovery describes their methodology: every context change is A/B tested against the previous baseline. Their dynamic context discovery rollout showed a **46.9% token reduction with maintained quality** — and they only knew this because they measured both arms against real workloads.
@@ -185,6 +189,8 @@ A practical A/B framework:
 5. **Hold one variable at a time.** Don't ship "compaction tweak + tool router refactor + new system prompt" together. You won't know which one helped or hurt.
 
 The placebo trap: it's surprisingly easy to convince yourself a change is helping when noise is the whole story. If the difference between arms is within day-to-day variance, you have no signal. Statistical significance matters even with informal experiments — eyeballing two numbers and seeing one is bigger is not a result.
+
+**Evaluating multi-agent architectures.** Anthropic's experience with their Research system offers a model: focus on end-state evaluation rather than turn-by-turn analysis. Multi-agent systems take different paths between runs — you can't prescribe a "correct" sequence of steps. Instead, evaluate whether the system achieved the correct final state. For research tasks: factual accuracy, completeness, source quality. For coding tasks: test pass rate, code quality metrics, spec compliance. The Superpowers methodology adds explicit review gates — spec compliance review (does it match the plan?) followed by code quality review (is it well-built?) — that serve as measurable intermediate checkpoints.
 
 ## 14.6 The Iteration Loop
 
@@ -226,6 +232,7 @@ After working with multiple production agent teams, a rough ranking of improveme
 3. **Add compaction with tool result clearing.** For agents that go past 100 turns, compaction (Chapter 3) plus selective tool result clearing (Chapter 4) keeps context utilization in the healthy 40–70% band instead of trending toward 95%.
 4. **Move large tool outputs to files.** Restorable compression (Chapter 11) for any tool output over ~10K characters. The model gets a path and a summary; the body lives on disk. This single change can halve average tokens per turn for tool-heavy agents.
 5. **Structure conversation history with summaries instead of full transcripts.** Older conversation segments collapsed into structured summaries (decisions, completed steps, current state) reduce context cost while preserving the information the model actually needs to continue.
+6. **Isolate with subagents for tasks over ~50 tool calls.** When a single agent session consistently exceeds 50 tool calls, context pollution is almost certain. Moving to a subagent-driven pattern — where each subtask runs in a fresh window and returns only a summary — has shown 83% reduction in parent context size (Chapter 13) and up to 90.2% quality improvement on breadth-first tasks (Anthropic's multi-agent research). The trade-off: total token consumption goes up ~15x. The gain: parent-agent attention quality stays high regardless of total task complexity.
 
 These are not the only improvements, but they are the ones that pay off most consistently. If your metrics suggest you're stuck and you don't know where to start, work this list from the top.
 
@@ -293,3 +300,5 @@ If you can check all of these, your context engineering is no longer guesswork. 
 8. **Design for iteration.** Modular layers, configurable thresholds, sampled logs of context layout, reversible changes. You will iterate; make it cheap.
 
 9. **Measurement pitfalls: happy-path-only, blind aggregation, average-only, under-logging.** Each one masks the failures you most need to fix.
+
+10. **Token usage predicts quality.** Anthropic's finding — token usage explains 80% of performance variance — reframes measurement. Track total tokens (including subagent tokens) as a leading indicator of quality, not just cost. When quality is low and budget allows, spending more tokens through multi-agent isolation is often the highest-ROI intervention.
