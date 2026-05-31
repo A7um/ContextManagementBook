@@ -238,7 +238,41 @@ We covered this above; the distinctive piece is the `docs/index.md` with verific
 
 As of 2026, `AGENTS.md` at the repo root is recognized by Claude Code, GitHub Copilot, Cursor, Gemini Code Assist, and OpenAI Codex. Each tool has its own native format (`CLAUDE.md`, `.cursor/rules/`, `copilot-instructions.md`), but most of them will also read `AGENTS.md` if present, and several projects use `AGENTS.md` as the canonical source and symlink the others to it. If you're writing for a team that uses more than one agent tool, write `AGENTS.md`; it's the lowest common denominator that actually reaches the model.
 
-## 4.6 Sizing Rules: Under 500 Lines, Usually Under 300
+## 4.6 Skills as Progressive Context: The Three-Level Loading Pattern
+
+Skills — typically packaged as `SKILL.md` files — represent a layer of the static context hierarchy that emerged in 2026. Unlike `CLAUDE.md` (always loaded at session start) or `docs/` files (loaded on demand by the agent's own judgment), skills use a **three-level progressive disclosure** pattern specifically designed for context efficiency.
+
+The pattern works because skills are *instructions*, not reference material. An agent with 100 installed skills cannot afford to load all of them — at an average of 1,500 tokens per skill body, that would consume 150K tokens, more than the entire effective window. Instead, the harness loads skills in three stages, each triggered by need:
+
+### Level 1 — Metadata only (~50 tokens per skill)
+
+At session start, the harness loads only each skill's name and one-line description from YAML frontmatter. With 100 installed skills, this costs ~5K tokens — less than 3% of a 200K window. The model can scan this manifest and know what capabilities are available without paying the cost of reading every skill's full body.
+
+### Level 2 — Full SKILL.md body (~500–2,000 tokens)
+
+When the agent identifies a task that matches a skill's description, it loads the full SKILL.md instructions. The body contains the process, decision trees, constraints, and rules — everything the agent needs to execute that skill. But critically, it does NOT contain heavy reference material.
+
+### Level 3 — Reference files (variable, loaded on demand)
+
+Heavy documentation, worked examples, API specs, and prompt templates live in a `references/` subdirectory alongside the SKILL.md. These are loaded only when the agent actually needs them during execution — for instance, a prompt template referenced by the skill instructions, or an API specification needed to generate correct output.
+
+### Production examples
+
+**Superpowers** (obra/superpowers): A complete development methodology packaged as skills. Skills like `subagent-driven-development`, `brainstorming`, `test-driven-development` each contain a SKILL.md with structured process and prompt templates in supporting files. The agent loads only the relevant skill for the current phase of work. The project demonstrates what a mature skill ecosystem looks like at scale — dozens of skills, each self-contained, with clear activation conditions.
+
+**Claude Code Plugins**: Anthropic's official plugin system bundles skills into namespaced packages. Discovery is cheap (Level 1); full instructions load only on activation. The documented recommendation: keep SKILL.md under 150 lines, move heavy docs to `references/`. This constraint exists because skill bodies sit in the context window alongside the active task — a 500-line skill body competes directly with the code the agent is trying to understand.
+
+**Semantic routers for large registries**: For skill registries exceeding ~50 skills, metadata-only routing becomes noisy — the model struggles to pick the right skill from a wall of one-line descriptions. Production systems use embedding-based semantic routers: embed the user's task description, compare against skill description embeddings, load the top-1 or top-3 matches. Measured result: **456x token reduction** versus loading all skill bodies, with comparable routing accuracy.
+
+### The context engineering insight
+
+Skills formalize what Chapter 5's tool-search pattern does for tools — they apply progressive disclosure to *instructions*, not just capabilities. The pattern is identical in structure: announce cheaply at Level 1, load fully at Level 2, expand references at Level 3. The taxonomy of what gets progressively disclosed is expanding: first it was tool schemas (§5.3), then project docs (§4.4), now skill instructions.
+
+> **Connection to Cursor's `.cursor/rules/*.mdc`** (section 4.5): Cursor's glob-scoped rules are essentially Level-2 skills triggered by file pattern rather than semantic match. The skill ecosystem generalizes this with explicit YAML frontmatter controlling activation — `description`, `when`, `globs`, `alwaysApply` — giving the harness multiple routing signals instead of a single glob.
+
+One deliberate design constraint worth noting: a `CLAUDE.md` at a plugin root is NOT loaded as project context. Plugins contribute context through skills, not through `CLAUDE.md`. This prevents always-on context bloat from plugin installation — without this rule, installing 20 plugins would inject 20 plugin-level `CLAUDE.md` files into the always-loaded layer, exactly the kind of unchecked growth that §4.4's Codex lesson warns against.
+
+## 4.7 Sizing Rules: Under 500 Lines, Usually Under 300
 
 The Claude Code community, Cursor forums, and Codex internal guidance all converge on the same empirical range: **project memory should stay under 300–500 lines.**
 
@@ -254,7 +288,7 @@ A signal you're bloated: your project memory contains sentences like "for more d
 
 Another signal: the memory file contains information the model already knows. "Python uses indentation for blocks." "React components are functions or classes." "Git commits should have descriptive messages." Delete these. The model knows. You are paying tokens to remind it of things it will not forget.
 
-## 4.7 The Cache Preservation Angle
+## 4.8 The Cache Preservation Angle
 
 Static context is the layer that benefits most from KV-cache. The provider's cache keys on an exact prefix match starting from the first token, so the tokens at the very front of the request — system prompt, then tool definitions, then project memory — are the ones that get cached. Every turn where those tokens are byte-identical to the previous turn, the provider serves their attention from cache.
 
@@ -269,7 +303,7 @@ That means:
 
 This discipline pays off. In a 50-turn session with a 5K-token static layer, cache preservation turns ~250K tokens of repeated input into ~250K tokens of *cached* input, billed at ~10% of the normal input rate. That's the difference between a session that's dominated by input costs and one that's dominated by (much smaller) output costs.
 
-## 4.8 Designing Your Own Static Context Layer
+## 4.9 Designing Your Own Static Context Layer
 
 A practical checklist when designing or auditing the static layer for a new agent.
 
@@ -303,7 +337,7 @@ Two qualitative checks:
 3. **"Could a human teammate use this?"** Read the static layer top to bottom. If you, as a new engineer on the team, would find it useful onboarding material, the model will too. If it reads like a bureaucratic checklist, the model will either ignore it or over-follow it.
 4. **"Is every line earning its place?"** For each line, ask: does this change the agent's behavior in at least one common scenario? If not, delete. This is the hardest discipline in static-context design because every line *feels* important when you're writing it. The ones that actually are remain useful months later; the rest are noise you're paying to ship every turn.
 
-## 4.9 Summary
+## 4.10 Summary
 
 Static context is the cache-preserving layer: the tokens that don't change across calls. It is the foundation on which everything dynamic sits.
 

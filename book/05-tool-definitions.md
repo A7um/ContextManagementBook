@@ -349,7 +349,25 @@ The ultimate test for a description is empirical: give the agent a task that sho
 
 A subtle byproduct of this discipline: **clear descriptions are shorter.** A description that clearly says "use when X, returns Y" is usually 50 tokens. A description that tries to hedge, restate, or enumerate edge cases is usually 200 tokens *and* harder for the model to act on. Good tool-description writing is a token optimization that looks like a quality optimization.
 
-## 5.6 MCP and the Tool Explosion
+## 5.6 Skills Face the Same Tax — and the Same Solutions
+
+The tool-definition tax from §5.1 has an exact parallel in skills. An agent with 100 installed skills and each SKILL.md averaging 1,500 tokens would spend 150K tokens loading them all — more than the entire effective window. The economics are identical: static overhead that the model pays on every inference call, whether it uses the skill or not.
+
+The same four production approaches from §5.3 apply, adapted to the skill domain:
+
+**1. Progressive disclosure (the default).** Only Level 1 metadata loads at session start — the skill's name and one-line description from YAML frontmatter, ~50 tokens per skill. This is the skill equivalent of Anthropic's `defer_loading`. Claude Code's plugin system enforces this by design: plugin skills never enter context until activated. At 100 skills, the Level 1 manifest costs ~5K tokens versus ~150K for full bodies — a 30x reduction in baseline overhead.
+
+**2. Semantic routing.** For registries exceeding ~50 skills, metadata-only routing becomes noisy. The model scans a wall of one-line descriptions and struggles to pick the right match. Production systems use embedding-based semantic routers: embed the user's task description, compare against skill description embeddings, load the top-1 or top-3 matches. Measured result: **456x token reduction** versus naive full-load, with comparable routing accuracy. The implementation is straightforward — a vector store over skill descriptions, queried once at the start of each turn before the LLM sees anything.
+
+**3. Hierarchical namespacing.** Superpowers-style plugins group skills by workflow phase: brainstorming → planning → implementation → review. The agent only considers skills within the current phase — a form of logit masking applied to skill selection. This mirrors Manus's approach from §5.3: the full catalog stays available (preserving cache), but the active subset is constrained by the current workflow state.
+
+**4. Frontmatter as routing signal.** SKILL.md files declare activation conditions in YAML frontmatter — `description`, `when`, `globs`, `alwaysApply`. The harness uses these as cheap routing signals before committing to a full load. A skill with `globs: ["**/*.py"]` only activates when the agent is working on Python files. A skill with `when: "user asks about deployment"` activates on semantic match against the task. These structured signals cost nearly zero tokens at routing time and prevent unnecessary Level 2 loads.
+
+> **The rule of thumb mirrors tools:** if your skill registry exceeds 15% of the context window at Level 1 (names + descriptions alone), you need routing. Below that threshold, the overhead is acceptable and the simplicity of loading the full manifest outweighs the complexity of a routing layer.
+
+The structural parallel to tools is no accident. Skills and tools are both *capabilities* the agent can invoke; they differ only in what they deliver (instructions vs. execution). The same information-theoretic constraint applies: the model's attention is finite, and anything in the context window that isn't relevant to the current task is noise that degrades performance. Progressive disclosure, semantic routing, and state-based filtering are general solutions to "too many capabilities in the hot path" — whether those capabilities are tool schemas or skill instructions.
+
+## 5.7 MCP and the Tool Explosion
 
 One implication of the math above is worth naming: MCP makes this problem worse before it makes it better.
 
@@ -359,7 +377,7 @@ This isn't a reason to avoid MCP; it's a reason to pair MCP with one of the four
 
 A later chapter in this book goes deeper into MCP specifically — its design goals, its trade-offs, and how to reason about it when you're the one designing an MCP server. For this chapter, the takeaway is that MCP amplifies the tool-definition tax, and the techniques here are how production systems keep that tax from dominating the budget.
 
-## 5.7 Summary
+## 5.8 Summary
 
 Tool definitions are static overhead that the model pays on every inference call, whether it uses the tools or not. At typical scales — 40 tools, three MCP servers, ~34K tokens per call — they can consume a third to a half of the context window and drag tool-selection accuracy below 50%.
 
