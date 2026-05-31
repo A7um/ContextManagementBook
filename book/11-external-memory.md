@@ -335,7 +335,46 @@ class PostgresMemoryTool(BetaAbstractMemoryTool):
 
 The abstract interface keeps the model-facing contract identical regardless of backend, which is the right design — the model should not care whether memory lives on a local disk or a database.
 
-## 11.8 Design Principles for the File System as Context
+## 11.8 Subagent Output to Filesystem — Minimizing the Game of Telephone
+
+Multi-agent architectures introduce a subtle context engineering problem: when a subagent passes large research results back through a lead coordinator agent's context, information gets lost or distorted at each hop. The coordinator asked for a comprehensive analysis; the subagent produced one; but by the time the result passes through the coordinator's context window to inform the next step, it's been compressed, paraphrased, or simply truncated. The dynamics are identical to a game of telephone — each relay degrades signal.
+
+Anthropic's multi-agent research system (published June 2025) addresses this directly: **subagents write their output to the filesystem (or an external artifact store), then pass only a lightweight reference back to the coordinator.**
+
+This is restorable compression (§11.3) applied to multi-agent communication:
+
+| What the subagent produces | What enters the coordinator's context |
+|---|---|
+| 8K-token research report | File path + 3-line summary (~80 tokens) |
+| Generated code module | File path + function signatures (~100 tokens) |
+| Structured data extraction | File path + row count + schema summary (~60 tokens) |
+
+The coordinator operates on references. When it needs the full content — to make a decision, to synthesize across subagents, or to pass specific details to the next subagent — it reads the file. The rest of the time, the reference is enough for routing and orchestration.
+
+The pattern works particularly well for structured outputs — code, reports, data tables — where the subagent's specialized prompt produces better results than filtering the same content through a general coordinator's context. A research subagent prompted specifically for academic rigor will produce a higher-quality synthesis than a coordinator asked to relay findings from a tool call. Writing that synthesis to a file preserves its full fidelity.
+
+Implementation is straightforward: subagents call tools to store their work in external systems (files, databases, artifact stores), then return a lightweight reference object to the coordinator:
+
+```python
+# Subagent's final action
+def complete_research(findings: str, summary: str) -> dict:
+    filepath = f"/workspace/.research/{task_id}-findings.md"
+    Path(filepath).write_text(findings)
+    return {
+        "status": "complete",
+        "artifact": filepath,
+        "summary": summary,  # 2-3 sentences only
+        "token_count": len(findings.split()),
+    }
+```
+
+The coordinator sees the summary and the path. It can route, prioritize, and orchestrate without loading 8K tokens of research into its own window. When synthesis requires the full content, one `cat` call brings it back.
+
+A related pattern from the same system: **the lead researcher saves its research plan to memory BEFORE spawning subagents.** The reason is defensive — if the coordinator's context exceeds 200K tokens, it will be truncated, and the research plan (which defines the entire session's direction) could be lost. Writing critical orchestration state to a file before the context grows is "write critical state to files before compaction" (§10.8) applied at the multi-agent level. The plan survives any truncation event because it lives on disk, not in the window.
+
+Together, these two patterns — subagent output to filesystem, coordinator state to filesystem — mean that multi-agent communication routes through durable storage rather than through volatile context windows. The filesystem becomes the shared memory bus; context windows become the per-agent working sets.
+
+## 11.9 Design Principles for the File System as Context
 
 A handful of principles fall out of the patterns above. They apply whether you're using Anthropic's memory tool, building Manus-style restorable compression, or rolling your own scratchpad system.
 
@@ -351,7 +390,7 @@ A handful of principles fall out of the patterns above. They apply whether you'r
 
 **Date-stamp meaningful entries.** ISO 8601 (`2026-04-12T14:30:00Z`) lets the model and human reviewers reason about staleness. The model should never have to guess whether a fact is from yesterday or last quarter.
 
-## 11.9 Lossless Context Management — Three Patterns
+## 11.10 Lossless Context Management — Three Patterns
 
 Three patterns recur across production systems. Together they form what some teams call **Lossless Context Management** (LCM): the discipline of designing so that no information that mattered is ever permanently lost, even when the window must be cleared.
 
@@ -444,7 +483,7 @@ The shutdown protocol is the inverse:
 
 Together, these three patterns give the agent something the context window alone cannot: a continuous identity across pulses. The window is volatile; the file system is durable; the protocols stitch them together.
 
-## 11.10 When File-Based Memory Is Not the Right Choice
+## 11.11 When File-Based Memory Is Not the Right Choice
 
 External memory has overhead. It's not free.
 
@@ -458,7 +497,7 @@ External memory has overhead. It's not free.
 
 The right framing: file-based memory is for tokens that need to **survive a context boundary** — either the window's size limit, a compaction event, or a session boundary. Tokens that don't need to survive any of these belong in the window.
 
-## 11.11 Key Takeaways
+## 11.12 Key Takeaways
 
 1. **The file system is extended context.** Treat files as tokens that exist outside the window but can be brought in on demand. Deciding what lives where is a context engineering decision.
 

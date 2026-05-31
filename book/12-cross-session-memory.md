@@ -305,7 +305,78 @@ Only then begin the task.
 
 The protocol is what closes the loop. Without it, accumulated memory exists but isn't actually consulted; the agent rederives instead of recalling. With it, memory becomes the first thing the agent checks, and every session benefits from every previous one.
 
-## 12.8 LangGraph's Production Pattern: Checkpointer ≠ Store
+## 12.8 Skills as Cross-Session Knowledge Units
+
+Skills (`SKILL.md` files, `.codex/skills/`, or dedicated skill directories) are the newest form of cross-session memory. Where other memory forms store facts, preferences, or corrections, skills encode reusable **procedures** — workflows the agent follows when a matching situation arises.
+
+The distinction from other memory forms is structural:
+
+| Memory Form | What It Stores | Example |
+|---|---|---|
+| CLAUDE.md | Invariants | "Always use pnpm" |
+| Session memory | Evolving facts | "Auth migration at iteration 3" |
+| Knowledge / Playbooks (Devin) | Successful patterns | "How we deploy to staging" |
+| Corrections | Past mistakes | "Don't use npm here" |
+| **Skills** | **Executable workflows** | "4-phase systematic debugging process" |
+
+The `obra/superpowers` project is the clearest example. It packages skills as standalone markdown files, each encoding a complete methodology:
+
+- **`systematic-debugging`** — a 4-phase root cause process: reproduce → isolate → hypothesize → verify. The skill specifies exact steps for each phase, including when to use binary search on commits vs. when to add instrumentation.
+- **`test-driven-development`** — encodes RED-GREEN-REFACTOR with explicit rules: write the failing test first, make it pass with minimal code, then refactor. The skill includes decision criteria for when to write unit vs. integration tests.
+- **`subagent-driven-development`** — encodes the full dispatch-review loop: decompose task → spawn specialized subagent → review output → integrate or retry.
+
+Each skill is typically 1000–1500 tokens — compact enough to load alongside the task context, rich enough to replace what would otherwise require the agent to figure out from scratch every session.
+
+**Skills compound across sessions.** Once a team writes a debugging skill, every future session benefits from the encoded methodology without per-session learning. The 50th debugging session uses the same refined process as the 5th — no regression, no drift. This is the cross-session property that matters: skills don't just persist knowledge, they persist *competence*.
+
+**Skills vs. Devin Playbooks.** The two are similar in spirit — both encode "how to do X" as a persistent, reusable unit. The difference is authorship and lifecycle:
+
+- Playbooks are **auto-generated** from successful sessions. The system observes what worked and crystallizes it.
+- Skills are **manually authored** (or agent-authored with human review). A senior engineer encodes their methodology directly.
+- Both persist across all future sessions and both are invoked by task-matching.
+
+The trade-off: playbooks capture implicit expertise that humans might not articulate; skills encode explicit methodology that observation might not surface. The best systems will use both.
+
+**Cross-organizational sharing.** The plugin packaging layer in tools like Claude Code and Cursor enables skills to cross not just session boundaries but organizational boundaries. A `systematic-debugging` skill authored at one company can be published, installed, and used at another. Knowledge units that cross project and team boundaries are a new category — prior cross-session memory (CLAUDE.md, Devin Knowledge) was always scoped to a single project or user.
+
+From a context engineering perspective, skills are the most compact form of cross-session knowledge because they encode a *procedure* rather than *facts*. A single 1500-token skill replaces what would otherwise require dozens of knowledge lookups, multiple correction checks, and significant in-session reasoning to reconstruct the same workflow. The procedure is pre-compiled; the agent just executes it.
+
+## 12.9 The ACE Pattern — Self-Updating Context
+
+The Agentic Context Engineering (ACE) pattern treats context not as static configuration but as a **living playbook that self-updates based on agent performance.** Where traditional context engineering asks "what should we put in the context?", ACE asks "how should context evolve based on what's working?"
+
+The core idea: after each session, evaluate what context helped and what didn't, then update the context sources accordingly. The context itself becomes a target of optimization, not just the agent's actions.
+
+The feedback loop:
+
+```
+Session N:
+  Agent performs task
+  → Measure outcome (success/failure, token efficiency, user corrections)
+  → Identify which context helped or hurt
+  → Update context configuration
+
+Session N+1:
+  Updated context loaded
+  → Better performance
+  → Further refinements
+  → ...
+```
+
+This extends the "explicit learning" principle from §12.11: instead of just writing corrections to memory, the ACE pattern updates the retrieval rules, skill triggers, and even the system prompt itself. The memory isn't just recording what happened — it's reshaping what the agent sees next time.
+
+What gets updated:
+
+- **Skill triggers.** If a debugging skill was loaded but unused (the task didn't require it), lower its match priority for similar future tasks. If it was loaded and heavily used, reinforce the trigger.
+- **Retrieval configuration.** If the agent repeatedly reads a memory file and then ignores it, the file's retrieval priority drops. If the agent reads a file and immediately applies its contents, the priority rises.
+- **System prompt content.** Instructions that consistently correlate with good outcomes get reinforced; instructions that correlate with failures or user corrections get revised or removed.
+- **Skill content.** When an agent discovers a better approach than what a skill prescribes, the skill itself can be updated — not just the memory that references it.
+
+The connection to Superpowers' `writing-skills` skill is direct: agents can create **new** skills based on workflows they discover during operation. If an agent solves a novel class of problem through a series of steps that works well, the ACE pattern formalizes that implicit discovery into a persistent, executable skill. The next session doesn't just remember that the approach worked — it has a ready-made procedure to follow.
+
+The key insight: traditional cross-session memory asks "what did we learn?" ACE asks "how should we learn differently next time?" It's meta-learning applied to context engineering — the context configuration itself is the thing being optimized across sessions.
+
+## 12.10 LangGraph's Production Pattern: Checkpointer ≠ Store
 
 LangGraph is the most widely deployed Python framework for stateful LLM agents. The single most common architecture mistake people make in it: confusing the **checkpointer** with the **store**.
 
@@ -402,7 +473,7 @@ The store entry is queryable, deduplicatable, updatable, and not paid for in eve
 
 **The rule:** if a fact would be useful in a future session with a different `thread_id`, it belongs in the store. If it's only useful for resuming this exact conversation, it belongs in the checkpointer.
 
-## 12.9 Design Principles for Cross-Session Memory
+## 12.11 Design Principles for Cross-Session Memory
 
 Five principles fall out of the patterns above.
 
@@ -429,7 +500,7 @@ Time-based expiry is a crude tool, but it beats no expiry. Better: track validat
 
 **Make learning explicit.** If the agent discovers something and doesn't write it down before the session ends, the learning is lost. OpenClaw enforces this with mandatory memoryFlush at 80% utilization. Claude Code's AutoDream consolidation runs after idle. The Brain-of-Markdown's startup hook says "add to corrections.md IMMEDIATELY when you make a mistake." All instances of the same idea: implicit learning is no learning.
 
-## 12.10 The Pattern Across Systems
+## 12.12 The Pattern Across Systems
 
 | System | Storage | Auto-Capture | Manual Curation | Retrieval |
 |--------|---------|--------------|-----------------|-----------|
@@ -444,7 +515,7 @@ Time-based expiry is a crude tool, but it beats no expiry. Better: track validat
 
 Despite varying architectures, every system converges on the same principles: **structured facts over raw transcripts, explicit capture over implicit learning, aggressive pruning over unbounded growth, retrieval before write.** A cross-session memory system that violates any of these will degrade with use.
 
-## 12.11 Key Takeaways
+## 12.13 Key Takeaways
 
 1. **Cross-session memory is context engineering.** The question is which tokens from past sessions enter the next session's window — and where they came from.
 
